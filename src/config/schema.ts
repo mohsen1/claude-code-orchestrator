@@ -3,6 +3,7 @@ import { z } from 'zod';
 export const OrchestratorConfigSchema = z.object({
   repositoryUrl: z.string().url({ message: 'Repository URL must be a valid URL' }),
   branch: z.string().default('main'),
+  model: z.string().optional(), // Claude model: 'haiku', 'sonnet', 'opus', or full model name
   cloneDepth: z.number().int().min(1).optional(), // shallow clone depth
   workerCount: z.number().int().min(1).max(20),
   hookServerPort: z.number().int().min(1024).max(65535).default(3000),

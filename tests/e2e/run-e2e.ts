@@ -1,0 +1,438 @@
+#!/usr/bin/env npx tsx
+/**
+ * End-to-End Test for Claude Code Orchestrator
+ *
+ * This test:
+ * 1. Creates a unique test branch (e2e-{timestamp})
+ * 2. Sets up a simple calculator project with PROJECT_DIRECTION.md
+ * 3. Runs the orchestrator with real Claude instances
+ * 4. Validates results after the test duration
+ *
+ * Usage:
+ *   npx tsx tests/e2e/run-e2e.ts [--repo <repo>] [--duration <minutes>] [--workers <count>]
+ *
+ * Requirements:
+ *   - gh CLI installed and authenticated
+ *   - Claude Code CLI installed
+ *   - Valid auth config (OAuth or api-keys.json)
+ */
+
+import { execa } from 'execa';
+import { writeFile, mkdir, rm, readFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { join } from 'path';
+import { parseArgs } from 'node:util';
+
+// Parse command line arguments
+const { values } = parseArgs({
+  options: {
+    repo: {
+      type: 'string',
+      short: 'r',
+      default: 'anthropics/claude-code-orchestrator-e2e-test',
+    },
+    duration: {
+      type: 'string',
+      short: 'd',
+      default: '5',
+    },
+    workers: {
+      type: 'string',
+      short: 'w',
+      default: '2',
+    },
+    'auth-config': {
+      type: 'string',
+      short: 'a',
+      description: 'Path to auth-configs.json',
+    },
+    model: {
+      type: 'string',
+      short: 'm',
+      default: 'haiku',
+      description: 'Claude model to use (haiku, sonnet, opus)',
+    },
+    cleanup: {
+      type: 'boolean',
+      default: true,
+    },
+  },
+});
+
+const TEST_REPO = values.repo!;
+const DURATION_MINUTES = parseInt(values.duration!, 10);
+const WORKER_COUNT = parseInt(values.workers!, 10);
+const AUTH_CONFIG_PATH = values['auth-config'];
+const MODEL = values.model!;
+
+const PROJECT_DIRECTION = `# Calculator Project
+
+## Overview
+Build a simple command-line calculator in TypeScript.
+
+## Requirements
+
+### Core Features
+1. **Basic Operations**: Add, subtract, multiply, divide
+2. **Input Handling**: Parse expressions like "2 + 3" or "10 / 2"
+3. **Error Handling**: Handle division by zero, invalid input
+
+### File Structure
+\`\`\`
+src/
+  calculator.ts    # Main calculator logic
+  parser.ts        # Expression parser
+  operations.ts    # Math operations
+  index.ts         # CLI entry point
+tests/
+  calculator.test.ts
+package.json
+tsconfig.json
+\`\`\`
+
+### Implementation Notes
+- Use TypeScript with strict mode
+- Include unit tests using vitest
+- Support decimal numbers
+- Print results to stdout
+
+## Success Criteria
+- All basic operations work correctly
+- Tests pass
+- Code compiles without errors
+`;
+
+interface TestResult {
+  success: boolean;
+  branchName: string;
+  duration: number;
+  commits: number;
+  filesCreated: string[];
+  workerBranches: string[];
+  errors: string[];
+}
+
+async function log(message: string, data?: unknown) {
+  const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+  if (data) {
+    console.log(`[${timestamp}] ${message}`, JSON.stringify(data, null, 2));
+  } else {
+    console.log(`[${timestamp}] ${message}`);
+  }
+}
+
+async function runCommand(cmd: string, args: string[], options?: { cwd?: string; reject?: boolean }): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  try {
+    const result = await execa(cmd, args, {
+      cwd: options?.cwd,
+      reject: options?.reject ?? true,
+    });
+    return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
+  } catch (err: any) {
+    if (options?.reject === false) {
+      return { stdout: err.stdout || '', stderr: err.stderr || '', exitCode: err.exitCode || 1 };
+    }
+    throw err;
+  }
+}
+
+async function ensureRepoExists(): Promise<void> {
+  log(`Checking if repo ${TEST_REPO} exists...`);
+
+  const { exitCode } = await runCommand('gh', ['repo', 'view', TEST_REPO], { reject: false });
+
+  if (exitCode !== 0) {
+    log(`Creating repo ${TEST_REPO}...`);
+    await runCommand('gh', [
+      'repo', 'create', TEST_REPO,
+      '--public',
+      '--description', 'E2E test repo for Claude Code Orchestrator',
+    ]);
+
+    // Initialize with a README
+    const tmpDir = `/tmp/e2e-repo-init-${Date.now()}`;
+    await mkdir(tmpDir, { recursive: true });
+    await runCommand('git', ['init'], { cwd: tmpDir });
+    await writeFile(join(tmpDir, 'README.md'), '# E2E Test Repository\n\nThis repo is used for automated e2e testing.\n');
+    await runCommand('git', ['add', '.'], { cwd: tmpDir });
+    await runCommand('git', ['commit', '-m', 'Initial commit'], { cwd: tmpDir });
+    await runCommand('git', ['branch', '-M', 'main'], { cwd: tmpDir });
+    await runCommand('git', ['remote', 'add', 'origin', `https://github.com/${TEST_REPO}.git`], { cwd: tmpDir });
+    await runCommand('git', ['push', '-u', 'origin', 'main'], { cwd: tmpDir });
+    await rm(tmpDir, { recursive: true, force: true });
+
+    log('Repo created and initialized');
+  } else {
+    log('Repo already exists');
+  }
+}
+
+async function createTestBranch(): Promise<string> {
+  const branchName = `e2e-${Date.now()}`;
+  log(`Creating test branch: ${branchName}`);
+
+  const tmpDir = `/tmp/e2e-branch-setup-${Date.now()}`;
+  await mkdir(tmpDir, { recursive: true });
+
+  try {
+    // Clone the repo
+    await runCommand('git', ['clone', `https://github.com/${TEST_REPO}.git`, tmpDir]);
+
+    // Create and checkout new branch
+    await runCommand('git', ['checkout', '-b', branchName], { cwd: tmpDir });
+
+    // Create PROJECT_DIRECTION.md
+    await writeFile(join(tmpDir, 'PROJECT_DIRECTION.md'), PROJECT_DIRECTION);
+
+    // Create basic package.json
+    const packageJson = {
+      name: 'calculator',
+      version: '1.0.0',
+      type: 'module',
+      scripts: {
+        build: 'tsc',
+        test: 'vitest run',
+        start: 'node dist/index.js',
+      },
+      devDependencies: {
+        typescript: '^5.0.0',
+        vitest: '^1.0.0',
+        '@types/node': '^20.0.0',
+      },
+    };
+    await writeFile(join(tmpDir, 'package.json'), JSON.stringify(packageJson, null, 2));
+
+    // Create tsconfig.json
+    const tsconfig = {
+      compilerOptions: {
+        target: 'ES2022',
+        module: 'NodeNext',
+        moduleResolution: 'NodeNext',
+        outDir: './dist',
+        rootDir: './src',
+        strict: true,
+        esModuleInterop: true,
+        skipLibCheck: true,
+      },
+      include: ['src/**/*'],
+    };
+    await writeFile(join(tmpDir, 'tsconfig.json'), JSON.stringify(tsconfig, null, 2));
+
+    // Create src directory
+    await mkdir(join(tmpDir, 'src'), { recursive: true });
+    await writeFile(join(tmpDir, 'src', '.gitkeep'), '');
+
+    // Commit and push
+    await runCommand('git', ['add', '.'], { cwd: tmpDir });
+    await runCommand('git', ['commit', '-m', 'Setup calculator project for e2e test'], { cwd: tmpDir });
+    await runCommand('git', ['push', '-u', 'origin', branchName], { cwd: tmpDir });
+
+    log(`Branch ${branchName} created and pushed`);
+    return branchName;
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function createTestConfig(branchName: string): Promise<string> {
+  const configDir = `/tmp/e2e-config-${Date.now()}`;
+  await mkdir(configDir, { recursive: true });
+
+  const config = {
+    repositoryUrl: `https://github.com/${TEST_REPO}.git`,
+    branch: branchName,
+    model: MODEL,
+    workerCount: WORKER_COUNT,
+    hookServerPort: 3456,
+    stuckThresholdMs: 180000, // 3 minutes
+    managerHeartbeatIntervalMs: 120000, // 2 minutes
+    maxRunDurationMinutes: DURATION_MINUTES + 2,
+  };
+
+  await writeFile(join(configDir, 'orchestrator.json'), JSON.stringify(config, null, 2));
+
+  // Copy auth config if provided
+  if (AUTH_CONFIG_PATH && existsSync(AUTH_CONFIG_PATH)) {
+    const authContent = await readFile(AUTH_CONFIG_PATH, 'utf-8');
+    await writeFile(join(configDir, 'auth-configs.json'), authContent);
+    log('Auth config copied');
+  }
+
+  log('Test config created', config);
+  return configDir;
+}
+
+async function runOrchestrator(configDir: string, durationMs: number): Promise<{ stdout: string; stderr: string }> {
+  log(`Starting orchestrator for ${durationMs / 60000} minutes...`);
+
+  const orchestratorPath = join(process.cwd(), 'dist', 'index.js');
+
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+
+    const proc = execa('node', [orchestratorPath, '--config', configDir], {
+      reject: false,
+      timeout: durationMs + 30000, // Add 30s buffer
+    });
+
+    proc.stdout?.on('data', (data) => {
+      const text = data.toString();
+      stdout += text;
+      process.stdout.write(text);
+    });
+
+    proc.stderr?.on('data', (data) => {
+      const text = data.toString();
+      stderr += text;
+      process.stderr.write(text);
+    });
+
+    // Set timeout to gracefully stop
+    setTimeout(async () => {
+      log('Duration reached, sending SIGTERM...');
+      proc.kill('SIGTERM');
+    }, durationMs);
+
+    proc.then(() => {
+      resolve({ stdout, stderr });
+    }).catch(() => {
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function validateResults(branchName: string): Promise<TestResult> {
+  log('Validating results...');
+
+  const result: TestResult = {
+    success: false,
+    branchName,
+    duration: DURATION_MINUTES,
+    commits: 0,
+    filesCreated: [],
+    workerBranches: [],
+    errors: [],
+  };
+
+  const tmpDir = `/tmp/e2e-validate-${Date.now()}`;
+  await mkdir(tmpDir, { recursive: true });
+
+  try {
+    // Clone and checkout the test branch
+    await runCommand('git', ['clone', `https://github.com/${TEST_REPO}.git`, tmpDir]);
+    await runCommand('git', ['fetch', '--all'], { cwd: tmpDir });
+    await runCommand('git', ['checkout', branchName], { cwd: tmpDir });
+
+    // Count commits on this branch (excluding initial)
+    const { stdout: logOutput } = await runCommand('git', ['log', '--oneline', `main..${branchName}`], { cwd: tmpDir, reject: false });
+    result.commits = logOutput.trim().split('\n').filter(l => l.trim()).length;
+
+    // List files created in src/
+    const { stdout: filesOutput } = await runCommand('git', ['ls-tree', '-r', '--name-only', 'HEAD', 'src/'], { cwd: tmpDir, reject: false });
+    result.filesCreated = filesOutput.trim().split('\n').filter(f => f.trim() && f !== 'src/.gitkeep');
+
+    // Check for worker branches
+    const { stdout: branchesOutput } = await runCommand('git', ['branch', '-r'], { cwd: tmpDir });
+    result.workerBranches = branchesOutput
+      .split('\n')
+      .map(b => b.trim())
+      .filter(b => b.includes('worker-'));
+
+    // Check for WORKER_*_TASK_LIST.md files
+    const { stdout: taskListsOutput } = await runCommand('git', ['ls-files', 'WORKER_*_TASK_LIST.md'], { cwd: tmpDir, reject: false });
+    const taskLists = taskListsOutput.trim().split('\n').filter(f => f.trim());
+
+    // Determine success
+    if (result.commits > 0) {
+      result.success = true;
+    } else {
+      result.errors.push('No commits were made');
+    }
+
+    if (taskLists.length === 0) {
+      result.errors.push('No WORKER_*_TASK_LIST.md files found');
+    }
+
+    log('Validation complete', result);
+    return result;
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function cleanup(configDir: string): Promise<void> {
+  if (values.cleanup) {
+    log('Cleaning up...');
+    await rm(configDir, { recursive: true, force: true });
+
+    // Kill any orphaned tmux sessions
+    await runCommand('bash', ['-c', "tmux list-sessions 2>/dev/null | grep '^claude-' | cut -d: -f1 | xargs -I{} tmux kill-session -t {} 2>/dev/null || true"]);
+
+    // Clean workspace
+    await rm('/tmp/orchestrator-workspace', { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function main() {
+  console.log('='.repeat(60));
+  console.log('Claude Code Orchestrator - E2E Test');
+  console.log('='.repeat(60));
+  console.log(`Repo: ${TEST_REPO}`);
+  console.log(`Duration: ${DURATION_MINUTES} minutes`);
+  console.log(`Workers: ${WORKER_COUNT}`);
+  console.log(`Model: ${MODEL}`);
+  console.log('='.repeat(60));
+
+  let configDir = '';
+  let branchName = '';
+
+  try {
+    // 1. Ensure test repo exists
+    await ensureRepoExists();
+
+    // 2. Create test branch with PROJECT_DIRECTION.md
+    branchName = await createTestBranch();
+
+    // 3. Create test config
+    configDir = await createTestConfig(branchName);
+
+    // 4. Build the project first
+    log('Building orchestrator...');
+    await runCommand('npm', ['run', 'build']);
+
+    // 5. Run orchestrator
+    const durationMs = DURATION_MINUTES * 60 * 1000;
+    await runOrchestrator(configDir, durationMs);
+
+    // 6. Validate results
+    const result = await validateResults(branchName);
+
+    // 7. Print summary
+    console.log('\n' + '='.repeat(60));
+    console.log('E2E TEST RESULTS');
+    console.log('='.repeat(60));
+    console.log(`Status: ${result.success ? 'PASSED' : 'FAILED'}`);
+    console.log(`Branch: ${result.branchName}`);
+    console.log(`Commits: ${result.commits}`);
+    console.log(`Files Created: ${result.filesCreated.length}`);
+    result.filesCreated.forEach(f => console.log(`  - ${f}`));
+    console.log(`Worker Branches: ${result.workerBranches.length}`);
+    result.workerBranches.forEach(b => console.log(`  - ${b}`));
+    if (result.errors.length > 0) {
+      console.log('Errors:');
+      result.errors.forEach(e => console.log(`  - ${e}`));
+    }
+    console.log('='.repeat(60));
+    console.log(`\nView results: https://github.com/${TEST_REPO}/tree/${branchName}`);
+
+    process.exit(result.success ? 0 : 1);
+  } catch (err) {
+    console.error('E2E test failed with error:', err);
+    process.exit(1);
+  } finally {
+    await cleanup(configDir);
+  }
+}
+
+main();

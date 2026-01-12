@@ -56,16 +56,21 @@ export class TmuxManager {
 
   /**
    * Create a session and start Claude immediately.
+   * @param model - Optional model to use (e.g., 'haiku', 'sonnet', 'opus')
    */
   async createSessionWithClaude(
     sessionName: string,
     cwd: string,
-    env: Record<string, string> = {}
+    env: Record<string, string> = {},
+    model?: string
   ): Promise<void> {
     await this.createSession(sessionName, cwd, env);
 
-    // Start Claude
-    await this.sendKeys(sessionName, 'claude --dangerously-skip-permissions', true);
+    // Start Claude with optional model
+    const claudeCmd = model
+      ? `claude --dangerously-skip-permissions --model ${model}`
+      : 'claude --dangerously-skip-permissions';
+    await this.sendKeys(sessionName, claudeCmd, true);
 
     // Wait for Claude to initialize
     await new Promise(r => setTimeout(r, 3000));
@@ -166,8 +171,9 @@ export class TmuxManager {
 
   /**
    * Ensure Claude is running in the session. Restart if dropped to shell.
+   * @param model - Optional model to use when restarting
    */
-  async ensureClaudeRunning(sessionName: string, workDir?: string): Promise<boolean> {
+  async ensureClaudeRunning(sessionName: string, workDir?: string, model?: string): Promise<boolean> {
     const isShell = await this.isAtShellPrompt(sessionName);
     if (isShell) {
       logger.warn(`Session ${sessionName} dropped to shell. Restarting Claude...`);
@@ -175,9 +181,10 @@ export class TmuxManager {
       await this.sendControlKey(sessionName, 'C-l');
       await new Promise(r => setTimeout(r, 500));
 
+      const modelFlag = model ? ` --model ${model}` : '';
       const cmd = workDir
-        ? `cd "${workDir}" && claude --dangerously-skip-permissions`
-        : 'claude --dangerously-skip-permissions';
+        ? `cd "${workDir}" && claude --dangerously-skip-permissions${modelFlag}`
+        : `claude --dangerously-skip-permissions${modelFlag}`;
       await this.sendKeys(sessionName, cmd, true);
 
       // Wait for Claude to start

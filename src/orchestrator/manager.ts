@@ -275,7 +275,7 @@ export class Orchestrator {
     logger.debug(`Wrote hooks to settings.json`, { path: settingsPath });
 
     // Create tmux session with env vars and start Claude
-    await this.tmux.createSessionWithClaude(sessionName, workDir, env);
+    await this.tmux.createSessionWithClaude(sessionName, workDir, env, this.config.model);
 
     const instance: ClaudeInstance = {
       id,
@@ -287,6 +287,7 @@ export class Orchestrator {
       toolUseCount: 0,
       createdAt: new Date(),
       apiKey: authConfig?.name, // Store auth config name for reference
+      model: this.config.model, // Store model for restarts
     };
 
     this.instanceManager.addInstance(instance);
@@ -628,7 +629,7 @@ If all workers are making good progress and there's nothing urgent, just respond
     const isShell = await this.tmux.isAtShellPrompt(sessionName);
     if (isShell) {
       logger.warn(`Instance ${instance.id} dropped to shell. Restarting Claude...`);
-      await this.tmux.ensureClaudeRunning(sessionName, instance.workDir);
+      await this.tmux.ensureClaudeRunning(sessionName, instance.workDir, instance.model);
 
       if (instance.currentTaskFull && instance.status === 'busy') {
         await new Promise(r => setTimeout(r, 5000));

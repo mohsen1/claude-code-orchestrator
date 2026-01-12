@@ -24,6 +24,7 @@ export interface ClaudeInstance {
   toolUseCount: number; // For cost tracking
   createdAt: Date;
   apiKey?: string; // If set, uses this key instead of OAuth
+  model?: string; // Claude model to use (e.g., 'haiku', 'sonnet', 'opus')
 }
 
 export class ClaudeInstanceManager {
@@ -56,7 +57,7 @@ export class ClaudeInstanceManager {
     const dir = workDir ?? instance.workDir;
 
     // 1. Check if at shell prompt (Claude crashed) and restart if needed
-    const didRestart = await this.tmux.ensureClaudeRunning(instance.sessionName, dir);
+    const didRestart = await this.tmux.ensureClaudeRunning(instance.sessionName, dir, instance.model);
     if (didRestart) {
       logger.info(`Restarted Claude for ${instanceId} before sending prompt`);
       // Wait for Claude to fully initialize after restart

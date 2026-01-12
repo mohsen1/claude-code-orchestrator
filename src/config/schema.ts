@@ -1,7 +1,10 @@
 import { z } from 'zod';
 
+// Git URL pattern: supports HTTPS (https://...) and SSH (git@host:...)
+const gitUrlPattern = /^(https?:\/\/|git@)[^\s]+$/;
+
 export const OrchestratorConfigSchema = z.object({
-  repositoryUrl: z.string().url({ message: 'Repository URL must be a valid URL' }),
+  repositoryUrl: z.string().regex(gitUrlPattern, { message: 'Repository URL must be a valid git URL (HTTPS or SSH)' }),
   branch: z.string().default('main'),
   model: z.string().optional(), // Claude model: 'haiku', 'sonnet', 'opus', or full model name
   cloneDepth: z.number().int().min(1).optional(), // shallow clone depth
@@ -13,7 +16,7 @@ export const OrchestratorConfigSchema = z.object({
   managerHeartbeatIntervalMs: z.number().int().min(60000).default(600000), // 10 minutes
   maxToolUsesPerInstance: z.number().int().min(100).default(500),
   maxTotalToolUses: z.number().int().min(500).default(2000),
-  maxRunDurationMinutes: z.number().int().min(10).default(120),
+  maxRunDurationMinutes: z.number().int().min(1).default(120), // min 1 minute for testing
 });
 
 export type OrchestratorConfig = z.infer<typeof OrchestratorConfigSchema>;

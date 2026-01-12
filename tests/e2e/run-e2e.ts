@@ -12,7 +12,7 @@
  *   npx tsx tests/e2e/run-e2e.ts [--repo <repo>] [--duration <minutes>] [--workers <count>]
  *
  * Requirements:
- *   - gh CLI installed and authenticated
+ *   - Git configured with push access to the test repo
  *   - Claude Code CLI installed
  *   - Valid auth config (OAuth or api-keys.json)
  */
@@ -29,7 +29,7 @@ const { values } = parseArgs({
     repo: {
       type: 'string',
       short: 'r',
-      default: 'anthropics/claude-code-orchestrator-e2e-test',
+      default: 'mohsen1/claude-code-orchestrator-e2e-test',
     },
     duration: {
       type: 'string',
@@ -136,37 +136,6 @@ async function runCommand(cmd: string, args: string[], options?: { cwd?: string;
   }
 }
 
-async function ensureRepoExists(): Promise<void> {
-  log(`Checking if repo ${TEST_REPO} exists...`);
-
-  const { exitCode } = await runCommand('gh', ['repo', 'view', TEST_REPO], { reject: false });
-
-  if (exitCode !== 0) {
-    log(`Creating repo ${TEST_REPO}...`);
-    await runCommand('gh', [
-      'repo', 'create', TEST_REPO,
-      '--public',
-      '--description', 'E2E test repo for Claude Code Orchestrator',
-    ]);
-
-    // Initialize with a README
-    const tmpDir = `/tmp/e2e-repo-init-${Date.now()}`;
-    await mkdir(tmpDir, { recursive: true });
-    await runCommand('git', ['init'], { cwd: tmpDir });
-    await writeFile(join(tmpDir, 'README.md'), '# E2E Test Repository\n\nThis repo is used for automated e2e testing.\n');
-    await runCommand('git', ['add', '.'], { cwd: tmpDir });
-    await runCommand('git', ['commit', '-m', 'Initial commit'], { cwd: tmpDir });
-    await runCommand('git', ['branch', '-M', 'main'], { cwd: tmpDir });
-    await runCommand('git', ['remote', 'add', 'origin', `https://github.com/${TEST_REPO}.git`], { cwd: tmpDir });
-    await runCommand('git', ['push', '-u', 'origin', 'main'], { cwd: tmpDir });
-    await rm(tmpDir, { recursive: true, force: true });
-
-    log('Repo created and initialized');
-  } else {
-    log('Repo already exists');
-  }
-}
-
 async function createTestBranch(): Promise<string> {
   const branchName = `e2e-${Date.now()}`;
   log(`Creating test branch: ${branchName}`);
@@ -175,8 +144,8 @@ async function createTestBranch(): Promise<string> {
   await mkdir(tmpDir, { recursive: true });
 
   try {
-    // Clone the repo
-    await runCommand('git', ['clone', `https://github.com/${TEST_REPO}.git`, tmpDir]);
+    // Clone the repo (use SSH for push access)
+    await runCommand('git', ['clone', `git@github.com:${TEST_REPO}.git`, tmpDir]);
 
     // Create and checkout new branch
     await runCommand('git', ['checkout', '-b', branchName], { cwd: tmpDir });
@@ -239,7 +208,7 @@ async function createTestConfig(branchName: string): Promise<string> {
   await mkdir(configDir, { recursive: true });
 
   const config = {
-    repositoryUrl: `https://github.com/${TEST_REPO}.git`,
+    repositoryUrl: `git@github.com:${TEST_REPO}.git`,
     branch: branchName,
     model: MODEL,
     workerCount: WORKER_COUNT,
@@ -320,7 +289,7 @@ async function validateResults(branchName: string): Promise<TestResult> {
 
   try {
     // Clone and checkout the test branch
-    await runCommand('git', ['clone', `https://github.com/${TEST_REPO}.git`, tmpDir]);
+    await runCommand('git', ['clone', `git@github.com:${TEST_REPO}.git`, tmpDir]);
     await runCommand('git', ['fetch', '--all'], { cwd: tmpDir });
     await runCommand('git', ['checkout', branchName], { cwd: tmpDir });
 
@@ -388,27 +357,24 @@ async function main() {
   let branchName = '';
 
   try {
-    // 1. Ensure test repo exists
-    await ensureRepoExists();
-
-    // 2. Create test branch with PROJECT_DIRECTION.md
+    // 1. Create test branch with PROJECT_DIRECTION.md
     branchName = await createTestBranch();
 
-    // 3. Create test config
+    // 2. Create test config
     configDir = await createTestConfig(branchName);
 
-    // 4. Build the project first
+    // 3. Build the project first
     log('Building orchestrator...');
     await runCommand('npm', ['run', 'build']);
 
-    // 5. Run orchestrator
+    // 4. Run orchestrator
     const durationMs = DURATION_MINUTES * 60 * 1000;
     await runOrchestrator(configDir, durationMs);
 
-    // 6. Validate results
+    // 5. Validate results
     const result = await validateResults(branchName);
 
-    // 7. Print summary
+    // 6. Print summary
     console.log('\n' + '='.repeat(60));
     console.log('E2E TEST RESULTS');
     console.log('='.repeat(60));

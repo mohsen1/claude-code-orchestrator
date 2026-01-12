@@ -1,5 +1,4 @@
 import { TmuxManager } from '../tmux/session.js';
-import { DockerManager } from '../docker/manager.js';
 import { logger } from '../utils/logger.js';
 
 export type InstanceType = 'manager' | 'worker';
@@ -16,74 +15,79 @@ export interface ClaudeInstance {
   id: string;
   type: InstanceType;
   workerId: number;
-  containerName: string;
   sessionName: string;
+  workDir: string;
   status: InstanceStatus;
   currentTask?: string;
   currentTaskFull?: string; // Full task description for context restoration
-  configPath: string;
   lastToolUse?: Date; // For heartbeat/stuck detection
   toolUseCount: number; // For cost tracking
   createdAt: Date;
+  apiKey?: string; // If set, uses this key instead of OAuth
 }
 
 export class ClaudeInstanceManager {
   private instances: Map<string, ClaudeInstance> = new Map();
 
-  constructor(
-    private _docker: DockerManager,
-    private tmux: TmuxManager
-  ) {}
+  constructor(private tmux: TmuxManager) {}
 
-  async createInstance(opts: {
-    id: string;
-    type: InstanceType;
-    workerId: number;
-    configPath: string;
-  }): Promise<ClaudeInstance> {
-    const containerName = `claude-${opts.type === 'manager' ? 'manager' : `worker-${opts.workerId}`}`;
-    const sessionName = `claude-${opts.id}`;
-
-    const instance: ClaudeInstance = {
-      id: opts.id,
-      type: opts.type,
-      workerId: opts.workerId,
-      containerName,
-      sessionName,
-      status: 'starting',
-      configPath: opts.configPath,
-      toolUseCount: 0,
-      createdAt: new Date(),
-    };
-
-    // Create tmux session with docker exec directly
-    await this.tmux.createSessionWithContainer(sessionName, containerName);
-
-    instance.status = 'ready';
-    this.instances.set(opts.id, instance);
-
-    logger.info(`Created Claude instance: ${opts.id}`, {
-      type: opts.type,
-      container: containerName,
+  /**
+   * Add an instance to the manager (used when orchestrator creates sessions directly).
+   */
+  addInstance(instance: ClaudeInstance): void {
+    this.instances.set(instance.id, instance);
+    logger.info(`Added instance: ${instance.id}`, {
+      type: instance.type,
+      workDir: instance.workDir,
+      hasApiKey: !!instance.apiKey,
     });
-
-    return instance;
   }
 
-  async sendPrompt(instanceId: string, prompt: string): Promise<void> {
+  /**
+   * Send a prompt to an instance with safety checks.
+   * Ensures Claude is running, clears screen, and waits before sending.
+   */
+  async sendPrompt(instanceId: string, prompt: string, workDir?: string): Promise<void> {
     const instance = this.instances.get(instanceId);
     if (!instance) {
       throw new Error(`Instance ${instanceId} not found`);
     }
 
+    const dir = workDir ?? instance.workDir;
+
+    // 1. Check if at shell prompt (Claude crashed) and restart if needed
+    const didRestart = await this.tmux.ensureClaudeRunning(instance.sessionName, dir);
+    if (didRestart) {
+      logger.info(`Restarted Claude for ${instanceId} before sending prompt`);
+      // Wait for Claude to fully initialize after restart
+      await new Promise(r => setTimeout(r, 5000));
+    }
+
+    // 2. Clear the screen for a clean slate
+    await this.tmux.sendControlKey(instance.sessionName, 'C-l');
+    await new Promise(r => setTimeout(r, 500));
+
+    // 3. Check if at Claude prompt (waiting for input)
+    const atPrompt = await this.tmux.isAtClaudePrompt(instance.sessionName);
+    if (!atPrompt) {
+      // Might be in the middle of something, send Ctrl+C first
+      logger.debug(`Instance ${instanceId} not at prompt, sending Ctrl+C first`);
+      await this.tmux.sendControlKey(instance.sessionName, 'C-c');
+      await new Promise(r => setTimeout(r, 2000));
+    }
+
+    // 4. Update instance state
     instance.status = 'busy';
     instance.currentTask = prompt.substring(0, 100);
     instance.currentTaskFull = prompt;
+    instance.lastToolUse = new Date(); // Reset stuck timer
 
+    // 5. Send the prompt
     await this.tmux.sendKeys(instance.sessionName, prompt);
 
     logger.debug(`Sent prompt to ${instanceId}`, {
       taskPreview: instance.currentTask,
+      didRestart,
     });
   }
 
@@ -180,6 +184,13 @@ export class ClaudeInstanceManager {
       instance.status = 'idle';
       logger.info(`Unlocked worker ${workerId}`);
     }
+  }
+
+  /**
+   * Remove an instance from tracking (without killing session).
+   */
+  removeInstance(instanceId: string): void {
+    this.instances.delete(instanceId);
   }
 
   async destroyInstance(instanceId: string): Promise<void> {

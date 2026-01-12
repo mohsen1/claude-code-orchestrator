@@ -1,5 +1,8 @@
 import { parseArgs } from 'node:util';
-import { Orchestrator } from './orchestrator/manager.js';
+import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { Orchestrator, AuthConfig } from './orchestrator/manager.js';
 import { ConfigLoader } from './config/loader.js';
 import { logger } from './utils/logger.js';
 
@@ -11,6 +14,12 @@ async function main(): Promise<void> {
         type: 'string',
         short: 'c',
         description: 'Path to config directory',
+      },
+      workspace: {
+        type: 'string',
+        short: 'w',
+        description: 'Path to workspace directory',
+        default: '/tmp/orchestrator-workspace',
       },
       help: {
         type: 'boolean',
@@ -32,15 +41,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Check for API key
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.error('Error: ANTHROPIC_API_KEY environment variable is required');
-    console.error('Set it with: export ANTHROPIC_API_KEY="your-api-key"');
-    process.exit(1);
-  }
+  const workspaceDir = values.workspace ?? '/tmp/orchestrator-workspace';
 
   logger.info('Claude Code Orchestrator starting...', {
     configDir: values.config,
+    workspaceDir,
   });
 
   // Load and validate configuration
@@ -62,8 +67,18 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Load auth configs (optional - OAuth is used by default)
+  const authConfigs = await loadAuthConfigs(values.config);
+
+  if (authConfigs.length > 0) {
+    logger.info(`Loaded ${authConfigs.length} auth config(s) for rotation: ${authConfigs.map(c => c.name).join(', ')}`);
+  } else {
+    logger.info('No auth configs loaded - using OAuth authentication');
+    logger.info('(Claude will use your local ~/.claude credentials)');
+  }
+
   // Create orchestrator
-  const orchestrator = new Orchestrator(config);
+  const orchestrator = new Orchestrator(config, workspaceDir, authConfigs);
 
   // Set up signal handlers for graceful shutdown
   setupSignalHandlers(orchestrator);
@@ -77,9 +92,9 @@ async function main(): Promise<void> {
       const status = orchestrator.getStatus();
       logger.info('Orchestrator status', {
         instances: status.instances,
-        tasks: status.tasks,
-        health: status.health,
         costs: status.costs,
+        mergeQueueSize: status.mergeQueueSize,
+        authConfigsAvailable: status.authConfigsAvailable,
       });
     }, 60000);
 
@@ -90,6 +105,88 @@ async function main(): Promise<void> {
   } catch (err) {
     logger.error('Failed to start orchestrator', err);
     process.exit(1);
+  }
+}
+
+/**
+ * Load auth configs from auth-configs.json in config directory.
+ * Supports API keys, z.ai configs, and other auth methods.
+ * Returns empty array if file doesn't exist (OAuth will be used).
+ *
+ * Example auth-configs.json:
+ * [
+ *   { "name": "api-key-1", "env": { "ANTHROPIC_API_KEY": "sk-ant-..." } },
+ *   { "name": "z.ai", "env": { "ANTHROPIC_AUTH_TOKEN": "...", "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic" } }
+ * ]
+ */
+async function loadAuthConfigs(configDir: string): Promise<AuthConfig[]> {
+  // Try both file names for backwards compatibility
+  const authConfigsPath = join(configDir, 'auth-configs.json');
+  const legacyPath = join(configDir, 'api-keys.json');
+
+  const configPath = existsSync(authConfigsPath) ? authConfigsPath : legacyPath;
+
+  if (!existsSync(configPath)) {
+    return [];
+  }
+
+  try {
+    const content = await readFile(configPath, 'utf-8');
+    const data = JSON.parse(content);
+
+    const configs: AuthConfig[] = [];
+
+    // Support array of AuthConfig objects
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        if (typeof item === 'string') {
+          // Legacy: plain API key string
+          configs.push({
+            name: `api-key-${configs.length + 1}`,
+            env: { ANTHROPIC_API_KEY: item },
+          });
+        } else if (item.env && typeof item.env === 'object') {
+          // Full AuthConfig
+          configs.push({
+            name: item.name || `config-${configs.length + 1}`,
+            env: item.env,
+          });
+        } else if (item.key) {
+          // Legacy: { key: "..." } format
+          configs.push({
+            name: item.name || `api-key-${configs.length + 1}`,
+            env: { ANTHROPIC_API_KEY: item.key },
+          });
+        }
+      }
+    }
+
+    // Support object with 'configs' or 'keys' array
+    if (data.configs && Array.isArray(data.configs)) {
+      for (const item of data.configs) {
+        if (item.env && typeof item.env === 'object') {
+          configs.push({
+            name: item.name || `config-${configs.length + 1}`,
+            env: item.env,
+          });
+        }
+      }
+    } else if (data.keys && Array.isArray(data.keys)) {
+      // Legacy: { keys: ["sk-...", "sk-..."] }
+      for (const key of data.keys) {
+        if (typeof key === 'string') {
+          configs.push({
+            name: `api-key-${configs.length + 1}`,
+            env: { ANTHROPIC_API_KEY: key },
+          });
+        }
+      }
+    }
+
+    return configs;
+  } catch (err) {
+    logger.warn('Failed to load auth configs', err);
+    return [];
   }
 }
 
@@ -132,24 +229,29 @@ function setupSignalHandlers(orchestrator: Orchestrator): void {
 
 function printHelp(): void {
   console.log(`
-Claude Code Orchestrator
-========================
+Claude Code Orchestrator (Host-Native)
+======================================
 
 A distributed system for orchestrating multiple Claude Code instances to work
-collaboratively on software projects.
+collaboratively on software projects. Runs directly on the host using tmux.
 
 Usage:
-  npm start -- --config <path>
-  node dist/index.js --config <path>
+  npm start -- --config <path> [--workspace <path>]
+  node dist/index.js --config <path> [--workspace <path>]
 
 Options:
-  -c, --config <path>  Path to config directory (required)
-  -h, --help           Show this help message
+  -c, --config <path>     Path to config directory (required)
+  -w, --workspace <path>  Path to workspace directory (default: /tmp/orchestrator-workspace)
+  -h, --help              Show this help message
+
+Authentication:
+  By default, Claude uses your local OAuth credentials (~/.claude).
+  To enable auth rotation (for rate limit handling), create auth-configs.json.
 
 Config Directory Structure:
   <config-dir>/
-  ├── orchestrator.json   Main orchestrator settings
-  └── api-keys.json       API key configuration (optional)
+  ├── orchestrator.json    Main orchestrator settings (required)
+  └── auth-configs.json    Auth configurations for rotation (optional)
 
 Example orchestrator.json:
   {
@@ -158,8 +260,22 @@ Example orchestrator.json:
     "workerCount": 3
   }
 
-For more information, see the documentation at:
-https://github.com/your-org/claude-code-orchestrator
+Example auth-configs.json (optional):
+  [
+    {
+      "name": "api-key-1",
+      "env": { "ANTHROPIC_API_KEY": "sk-ant-..." }
+    },
+    {
+      "name": "z.ai",
+      "env": {
+        "ANTHROPIC_AUTH_TOKEN": "your-z-ai-token",
+        "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"
+      }
+    }
+  ]
+
+For more information, see the documentation.
 `);
 }
 

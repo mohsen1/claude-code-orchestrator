@@ -1,5 +1,5 @@
 #!/bin/bash
-# scripts/cleanup.sh - Force cleanup orphaned orchestrator resources
+# scripts/cleanup.sh - Force cleanup orchestrator resources
 
 set -e
 
@@ -15,35 +15,12 @@ done
 echo "  Done"
 echo ""
 
-# Stop and remove orchestrator containers
-echo "Stopping Docker containers..."
-docker ps -a --filter "label=orchestrator.instance" --format "{{.Names}}" 2>/dev/null | while read container; do
-    echo "  Stopping: $container"
-    docker stop "$container" 2>/dev/null || true
-    docker rm "$container" 2>/dev/null || true
-done
-echo "  Done"
-echo ""
-
-# Remove docker-compose resources
-if [ -f "./docker-compose.yml" ]; then
-    echo "Running docker-compose down..."
-    docker-compose down -v 2>/dev/null || true
+# Clean up workspace
+if [ -d "/tmp/orchestrator-workspace" ]; then
+    echo "Cleaning up workspace..."
+    rm -rf /tmp/orchestrator-workspace
     echo "  Done"
     echo ""
 fi
-
-# Clean up any orphaned volumes
-echo "Cleaning up volumes..."
-docker volume ls --filter "name=repo-data" -q 2>/dev/null | xargs -r docker volume rm 2>/dev/null || true
-docker volume ls --filter "name=claude-" -q 2>/dev/null | xargs -r docker volume rm 2>/dev/null || true
-echo "  Done"
-echo ""
-
-# Clean up networks
-echo "Cleaning up networks..."
-docker network ls --filter "name=orchestrator" -q 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
-echo "  Done"
-echo ""
 
 echo "Cleanup complete!"

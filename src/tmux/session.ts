@@ -5,53 +5,70 @@ export class TmuxManager {
   private sessions: Set<string> = new Set();
 
   /**
-   * Create a tmux session that runs docker exec directly.
-   * This is more robust than attaching after session creation.
+   * Create a tmux session with optional environment variables.
+   * This allows per-worker auth isolation without Docker.
+   *
+   * If no ANTHROPIC_API_KEY is provided in env, Claude will use host OAuth.
    */
-  async createSessionWithContainer(
+  async createSession(
     sessionName: string,
-    containerName: string,
-    command: string = 'claude --dangerously-skip-permissions'
+    cwd: string,
+    env: Record<string, string> = {}
   ): Promise<void> {
     try {
-      // Check if session already exists
-      const exists = await this.sessionExists(sessionName);
-      if (exists) {
-        logger.warn(`Session ${sessionName} already exists, killing it first`);
+      if (await this.sessionExists(sessionName)) {
+        logger.warn(`Session ${sessionName} exists, killing...`);
         await this.killSession(sessionName);
       }
 
-      // Create session with docker exec as the command
-      const dockerCommand = `docker exec -it ${containerName} /bin/bash -c "${command}"`;
+      // 1. Create the session detached in the correct directory
+      await execa('tmux', ['new-session', '-d', '-s', sessionName, '-c', cwd]);
 
-      await execa('tmux', ['new-session', '-d', '-s', sessionName, dockerCommand]);
+      // 2. Set options to prevent auto-rename (cosmetic but helpful for debugging)
+      await execa('tmux', ['set-option', '-t', sessionName, 'allow-rename', 'off']);
+
+      // 3. Inject Environment Variables into this specific session
+      // This sets it for tmux, but the running shell needs explicit export
+      for (const [key, value] of Object.entries(env)) {
+        await execa('tmux', ['set-environment', '-t', sessionName, key, value]);
+      }
+
+      // 4. Export env vars in the shell so they're available to claude
+      // Use single quotes for values to prevent shell expansion of $ chars
+      if (Object.keys(env).length > 0) {
+        const exportCmd = Object.entries(env)
+          .map(([k, v]) => `export ${k}='${v.replace(/'/g, "'\\''")}'`)
+          .join(' && ');
+        await this.sendKeys(sessionName, exportCmd, true);
+        // Clear screen so we don't expose secrets in terminal history
+        await this.sendKeys(sessionName, 'clear', true);
+      }
 
       this.sessions.add(sessionName);
-      logger.info(`Created tmux session: ${sessionName} (attached to ${containerName})`);
+      logger.info(`Created session: ${sessionName}`, {
+        envKeys: Object.keys(env),
+      });
     } catch (err) {
-      logger.error(`Failed to create tmux session: ${sessionName}`, err);
+      logger.error(`Failed to create session: ${sessionName}`, err);
       throw err;
     }
   }
 
   /**
-   * Create a plain tmux session without attaching to a container.
+   * Create a session and start Claude immediately.
    */
-  async createSession(sessionName: string): Promise<void> {
-    try {
-      const exists = await this.sessionExists(sessionName);
-      if (exists) {
-        logger.warn(`Session ${sessionName} already exists`);
-        return;
-      }
+  async createSessionWithClaude(
+    sessionName: string,
+    cwd: string,
+    env: Record<string, string> = {}
+  ): Promise<void> {
+    await this.createSession(sessionName, cwd, env);
 
-      await execa('tmux', ['new-session', '-d', '-s', sessionName]);
-      this.sessions.add(sessionName);
-      logger.info(`Created tmux session: ${sessionName}`);
-    } catch (err) {
-      logger.error(`Failed to create tmux session: ${sessionName}`, err);
-      throw err;
-    }
+    // Start Claude
+    await this.sendKeys(sessionName, 'claude --dangerously-skip-permissions', true);
+
+    // Wait for Claude to initialize
+    await new Promise(r => setTimeout(r, 3000));
   }
 
   /**
@@ -92,8 +109,6 @@ export class TmuxManager {
 
   /**
    * Capture the visible pane content.
-   * WARNING: Do NOT use this for control flow decisions.
-   * Use hooks for state changes. This is for logging/debugging only.
    */
   async capturePane(sessionName: string, lines: number = 100): Promise<string> {
     try {
@@ -110,6 +125,66 @@ export class TmuxManager {
       logger.debug(`Failed to capture pane for ${sessionName}`, err);
       return '';
     }
+  }
+
+  /**
+   * Check if session is at a shell prompt (Claude crashed/exited).
+   * Detects patterns like: user@host$, root#, bash-5.1$, etc.
+   */
+  async isAtShellPrompt(sessionName: string): Promise<boolean> {
+    const content = await this.capturePane(sessionName, 5);
+    const lastLines = content.trim().split('\n').slice(-3).join('\n');
+    // Shell prompt patterns
+    return /[$#>]\s*$/.test(lastLines) &&
+           !lastLines.includes('❯') && // Not Claude prompt
+           !lastLines.includes('⏺'); // Not Claude output
+  }
+
+  /**
+   * Check if session is at Claude's input prompt (waiting for user input).
+   */
+  async isAtClaudePrompt(sessionName: string): Promise<boolean> {
+    const content = await this.capturePane(sessionName, 5);
+    const lastLines = content.trim().split('\n').slice(-3).join('\n');
+    // Claude prompt indicator
+    return lastLines.includes('❯') || lastLines.includes('───────');
+  }
+
+  /**
+   * Check if session shows a confirmation prompt (y/N, Enter to continue, etc.)
+   */
+  async hasConfirmationPrompt(sessionName: string): Promise<string | null> {
+    const content = await this.capturePane(sessionName, 10);
+    if (content.includes('(y/N)') || content.includes('(Y/n)')) {
+      return 'y';
+    }
+    if (content.includes('Press Enter') || content.includes('press enter')) {
+      return 'Enter';
+    }
+    return null;
+  }
+
+  /**
+   * Ensure Claude is running in the session. Restart if dropped to shell.
+   */
+  async ensureClaudeRunning(sessionName: string, workDir?: string): Promise<boolean> {
+    const isShell = await this.isAtShellPrompt(sessionName);
+    if (isShell) {
+      logger.warn(`Session ${sessionName} dropped to shell. Restarting Claude...`);
+      // Clear screen and restart
+      await this.sendControlKey(sessionName, 'C-l');
+      await new Promise(r => setTimeout(r, 500));
+
+      const cmd = workDir
+        ? `cd "${workDir}" && claude --dangerously-skip-permissions`
+        : 'claude --dangerously-skip-permissions';
+      await this.sendKeys(sessionName, cmd, true);
+
+      // Wait for Claude to start
+      await new Promise(r => setTimeout(r, 3000));
+      return true; // Did restart
+    }
+    return false; // Was already running
   }
 
   /**

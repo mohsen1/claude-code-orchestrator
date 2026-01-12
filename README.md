@@ -24,12 +24,8 @@ npm install
 # Build
 npm run build
 
-# Run locally (uses host OAuth)
-npm run local -- --config ./config
-
-# Run with Docker (requires ANTHROPIC_API_KEY)
-export ANTHROPIC_API_KEY="sk-ant-..."
-npm run dev -- --config ./config
+# Run (uses host OAuth by default, or auth-configs.json for rotation)
+npm start -- --config ./config
 ```
 
 ## Configuration
@@ -137,8 +133,8 @@ Use Express.js and TypeScript. Include tests.
 ## Commands
 
 ```bash
-npm run local   # Run without Docker (OAuth + API key rotation)
-npm run dev     # Run with Docker (requires ANTHROPIC_API_KEY)
+npm start       # Run orchestrator
+npm run dev     # Run with tsx (no build needed)
 npm run build   # Compile TypeScript
 npm test        # Run tests
 ```
@@ -146,15 +142,12 @@ npm test        # Run tests
 ## Scripts
 
 ```bash
-./scripts/setup.sh      # Initial setup
-./scripts/cleanup.sh    # Clean orphaned resources
-./scripts/hard-reset.sh # Full data reset
+./scripts/cleanup.sh    # Clean orphaned tmux sessions and workspace
 ```
 
 ## Requirements
 
 - Node.js 22+
-- Docker (for containerized mode)
 - tmux
 - git
 - Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)

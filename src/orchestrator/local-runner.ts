@@ -110,11 +110,11 @@ export class LocalOrchestrator {
 
     this.git = new GitManager(this.workspaceDir);
 
-    // Create worktrees for workers
+    // Create worktrees for workers in parallel
     const worktreesDir = `${this.workspaceDir}/worktrees`;
     await mkdir(worktreesDir, { recursive: true });
 
-    for (let i = 1; i <= this.config.workerCount; i++) {
+    const createWorktree = async (i: number) => {
       const branchName = `worker-${i}`;
       const worktreePath = `${worktreesDir}/worker-${i}`;
 
@@ -130,7 +130,11 @@ export class LocalOrchestrator {
       await this.copyEnvFiles(this.workspaceDir, worktreePath);
 
       logger.info(`Created worktree for worker-${i}`, { path: worktreePath });
-    }
+    };
+
+    await Promise.all(
+      Array.from({ length: this.config.workerCount }, (_, i) => createWorktree(i + 1))
+    );
   }
 
   /**

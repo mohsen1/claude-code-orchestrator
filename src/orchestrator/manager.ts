@@ -400,18 +400,18 @@ You are the **Manager** instance of a Claude Code Orchestrator.
 - Worker instances: ${this.config.workerCount} workers
 - Workers have worktrees at: ${this.workspaceDir}/worktrees/worker-{N}
 
-## CRITICAL: Event-Driven Architecture
-- Do NOT poll or loop - just complete your task and STOP
-- You'll receive new prompts when workers finish
+## CRITICAL RULES
+1. **NEVER ask questions** - make decisions autonomously
+2. **NEVER output instructions for others** - take action yourself or send prompts to workers
+3. **Event-driven** - complete your task and STOP, you'll get new prompts when workers finish
+4. **Be decisive** - if something is unclear, make a reasonable choice and proceed
 
 ## Your Task Now
 
 1. **Read PROJECT_DIRECTION.md** to understand what to build
 
 2. **Create task lists** for each worker:
-   - WORKER_1_TASK_LIST.md
-   - WORKER_2_TASK_LIST.md
-   ${this.config.workerCount > 2 ? `- ... up to WORKER_${this.config.workerCount}_TASK_LIST.md` : ''}
+   - WORKER_1_TASK_LIST.md through WORKER_${this.config.workerCount}_TASK_LIST.md
 
    Format:
    \`\`\`markdown
@@ -462,28 +462,39 @@ You are **Worker ${workerId}** in a Claude Code Orchestrator.
 ## Your Environment
 - Working directory: ${worktreePath}
 - Your branch: worker-${workerId}
-- **Target branch: ${this.config.branch}** (pull updates from here, Manager merges your work here)
+- **Target branch: ${this.config.branch}** (always pull from here first!)
+
+## CRITICAL RULES
+1. **NEVER ask questions** - make reasonable decisions and proceed
+2. **ALWAYS pull ${this.config.branch} first** - your worktree must be current before starting work
+3. **NEVER delete files** unless your task explicitly requires it
+4. **Keep commits focused** - one task = one commit
 
 ## Your Workflow
 
-1. **Pull latest and read your tasks**:
+1. **FIRST - Sync with ${this.config.branch}**:
    \`\`\`bash
-   git pull origin ${this.config.branch}
+   git fetch origin
+   git reset --hard origin/${this.config.branch}
+   \`\`\`
+
+2. **Read your task list**:
+   \`\`\`bash
    cat WORKER_${workerId}_TASK_LIST.md
    \`\`\`
 
-2. **Work on "Current Task"** from your task list
+3. **Work on "Current Task"** - implement it fully
 
-3. **When done, commit and push**:
+4. **Commit and push when done**:
    \`\`\`bash
    git add -A
-   git commit -m "Complete: <description>"
-   git push origin worker-${workerId}
+   git commit -m "Complete: <task description>"
+   git push origin worker-${workerId} --force
    \`\`\`
 
-4. **STOP after pushing** - wait for Manager to merge
+5. **STOP after pushing** - Manager will merge your work
 
-Start now: Pull ${this.config.branch} and read your task list.
+Start now: Sync with ${this.config.branch}, then read your task list.
     `.trim();
 
     await this.instanceManager.sendPrompt(`worker-${workerId}`, prompt);
@@ -512,18 +523,48 @@ Start now: Pull ${this.config.branch} and read your task list.
   }
 
   private async notifyManagerOfCompletion(workerId: number): Promise<void> {
+    const workerWorktree = `${this.workspaceDir}/worktrees/worker-${workerId}`;
     const prompt = `
 ## Worker ${workerId} Completed
 
 Worker ${workerId} pushed to branch \`worker-${workerId}\`.
 
-### Actions:
-1. Review: \`git fetch origin worker-${workerId} && git diff ${this.config.branch}...origin/worker-${workerId}\`
-2. Merge: \`git merge origin/worker-${workerId} --no-ff -m "Merge worker-${workerId}"\`
-3. Push: \`git push origin ${this.config.branch}\`
-4. Update WORKER_${workerId}_TASK_LIST.md (move task to Completed, set next Current Task)
-5. Commit the task list update
-6. STOP
+## CRITICAL RULES
+- **NEVER ask questions** - make decisions and act
+- **NEVER say "Worker must..."** - YOU handle problems or send the worker a fix command
+- **If merge conflicts or deletions detected** - reset the worker's branch and tell them to re-pull
+
+## Your Actions
+
+1. **Fetch and review**:
+   \`\`\`bash
+   git fetch origin worker-${workerId}
+   git diff ${this.config.branch}...origin/worker-${workerId} --stat
+   \`\`\`
+
+2. **Check for problems** (deletions of existing files, conflicts):
+   - If worker's branch DELETES files that exist on ${this.config.branch}, DO NOT MERGE
+   - Instead, reset the worker and tell them to re-pull:
+     \`\`\`bash
+     # In worker's worktree, reset to latest ${this.config.branch}
+     cd ${workerWorktree}
+     git fetch origin
+     git reset --hard origin/${this.config.branch}
+     git push origin worker-${workerId} --force
+     \`\`\`
+   - Then STOP - the worker will get a new prompt to continue
+
+3. **If clean merge possible**:
+   \`\`\`bash
+   git merge origin/worker-${workerId} --no-ff -m "Merge worker-${workerId}"
+   git push origin ${this.config.branch}
+   \`\`\`
+
+4. **Update task list**: Move completed task to "Completed", set next "Current Task"
+
+5. **Commit and push task update**
+
+6. **STOP**
     `.trim();
 
     await this.instanceManager.sendPrompt('manager', prompt);
@@ -586,14 +627,15 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
     logger.info('Sending manager heartbeat');
 
     const heartbeatPrompt = `
-HEARTBEAT CHECK - Please perform a routine status check:
+HEARTBEAT CHECK - Perform routine maintenance. NEVER ask questions, just act.
 
-1. Check worker progress by examining recent git commits and branch status
-2. Review any completed work that needs to be merged
-3. Identify idle workers and assign them new tasks if available
-4. Update task files if needed based on project progress
+1. **Check branches**: \`git fetch --all && git branch -r | grep worker\`
+2. **Review pending merges**: If any worker branch is ahead, merge it (follow standard merge process)
+3. **Check worker progress**: Read WORKER_*_TASK_LIST.md files to see current tasks
+4. **Sync workers if needed**: If a worker's branch is behind ${this.config.branch}, their worktree needs a pull
 
-If all workers are making good progress and there's nothing urgent, just respond with a brief status summary.
+If everything looks good: Output a one-line status and STOP.
+If action needed: Take the action, then STOP.
 `.trim();
 
     this.instanceManager.updateStatus('manager', 'busy');

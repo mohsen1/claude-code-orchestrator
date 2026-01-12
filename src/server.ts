@@ -121,15 +121,15 @@ export class HookServer {
    * Stop the server.
    */
   stop(): Promise<void> {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       if (this.server) {
         this.server.close((err) => {
-          if (err) {
-            reject(err);
-          } else {
-            logger.info('Hook server stopped');
-            resolve();
+          if (err && (err as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') {
+            logger.warn('Error stopping hook server', err);
           }
+          this.server = null;
+          logger.info('Hook server stopped');
+          resolve();
         });
       } else {
         resolve();

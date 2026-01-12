@@ -91,6 +91,16 @@ When running locally, the orchestrator automatically rotates authentication when
 
 Your target repository should include a `PROJECT_DIRECTION.md` file that describes what to build. The Manager reads this file and creates task lists for workers.
 
+### Environment Files
+
+The orchestrator automatically copies `.env` and `.env.local` files from the main repository to each worker's worktree. This ensures environment variables are available in all parallel workspaces.
+
+Supported env files:
+- `.env` - Main environment variables
+- `.env.local` - Local overrides (not committed to git)
+
+These files are copied (not symlinked) to maintain isolation between worktrees.
+
 Example PROJECT_DIRECTION.md:
 
 ```markdown

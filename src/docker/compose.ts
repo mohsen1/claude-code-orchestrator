@@ -22,6 +22,8 @@ interface ComposeConfig {
   volumes: Record<string, Record<string, never>>;
 }
 
+const ENV_FILES = ['.env', '.env.local'];
+
 export class ComposeGenerator {
   generateCompose(opts: {
     workerCount: number;
@@ -30,6 +32,7 @@ export class ComposeGenerator {
     branch: string;
     configDir: string;
     useApiKey?: boolean;
+    envFilesDir?: string; // Directory containing .env files to copy to containers
   }): ComposeConfig {
     const services: Record<string, ComposeService> = {};
 
@@ -44,6 +47,7 @@ export class ComposeGenerator {
       branch: opts.branch,
       configDir: opts.configDir,
       useApiKey: opts.useApiKey,
+      envFilesDir: opts.envFilesDir,
     });
 
     // Worker services
@@ -58,6 +62,7 @@ export class ComposeGenerator {
         branch: opts.branch,
         configDir: opts.configDir,
         useApiKey: opts.useApiKey,
+        envFilesDir: opts.envFilesDir,
       });
     }
 
@@ -85,6 +90,7 @@ export class ComposeGenerator {
     branch: string;
     configDir: string;
     useApiKey?: boolean;
+    envFilesDir?: string;
   }): ComposeService {
     const environment: Record<string, string> = {
       WORKER_ID: opts.workerId.toString(),
@@ -107,6 +113,14 @@ export class ComposeGenerator {
     if (!opts.useApiKey) {
       // Mount config directory read-only
       volumes.push(`${opts.configDir}/${opts.workerId}:/claude-config:ro`);
+    }
+
+    // Mount .env and .env.local files if they exist in the source directory
+    if (opts.envFilesDir) {
+      for (const envFile of ENV_FILES) {
+        // Mount env files to /workspace (where the repo will be cloned)
+        volumes.push(`${opts.envFilesDir}/${envFile}:/workspace/${envFile}:ro`);
+      }
     }
 
     return {

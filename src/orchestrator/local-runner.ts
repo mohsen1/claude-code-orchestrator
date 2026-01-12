@@ -12,8 +12,12 @@ import { LocalConfigManager, ApiKeyConfig } from '../claude/local-config-manager
 import { RateLimitDetector } from '../claude/rate-limit-detector.js';
 import { GitManager } from '../git/worktree.js';
 import { execa } from 'execa';
-import { mkdir, rm } from 'fs/promises';
+import { mkdir, rm, copyFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { join } from 'path';
 import { logger } from '../utils/logger.js';
+
+const ENV_FILES = ['.env', '.env.local'];
 
 export class LocalOrchestrator {
   private hookServer: HookServer;
@@ -118,7 +122,30 @@ export class LocalOrchestrator {
       // Create worktree
       await execa('git', ['-C', this.workspaceDir, 'worktree', 'add', worktreePath, branchName]);
 
+      // Copy env files to worktree
+      await this.copyEnvFiles(this.workspaceDir, worktreePath);
+
       logger.info(`Created worktree for worker-${i}`, { path: worktreePath });
+    }
+  }
+
+  /**
+   * Copy .env and .env.local files from source to destination directory.
+   * These files are not tracked by git but are needed for the project to run.
+   */
+  private async copyEnvFiles(sourceDir: string, destDir: string): Promise<void> {
+    for (const envFile of ENV_FILES) {
+      const sourcePath = join(sourceDir, envFile);
+      const destPath = join(destDir, envFile);
+
+      if (existsSync(sourcePath)) {
+        try {
+          await copyFile(sourcePath, destPath);
+          logger.debug(`Copied ${envFile} to ${destDir}`);
+        } catch (err) {
+          logger.warn(`Failed to copy ${envFile} to ${destDir}`, err);
+        }
+      }
     }
   }
 

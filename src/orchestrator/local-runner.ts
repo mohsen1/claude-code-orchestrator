@@ -1,6 +1,6 @@
 /**
  * Local runner - runs Claude Code instances directly without Docker.
- * Uses the host's OAuth authentication.
+ * Supports OAuth and API key authentication with automatic rotation on rate limits.
  */
 
 import { OrchestratorConfig } from '../config/schema.js';
@@ -8,6 +8,8 @@ import { HookServer } from '../server.js';
 import { TmuxManager } from '../tmux/session.js';
 import { ClaudeInstanceManager, ClaudeInstance, InstanceType } from '../claude/instance.js';
 import { registerHookHandlers } from '../claude/hook-handlers.js';
+import { LocalConfigManager, ApiKeyConfig } from '../claude/local-config-manager.js';
+import { RateLimitDetector } from '../claude/rate-limit-detector.js';
 import { GitManager } from '../git/worktree.js';
 import { execa } from 'execa';
 import { mkdir, rm } from 'fs/promises';
@@ -17,6 +19,8 @@ export class LocalOrchestrator {
   private hookServer: HookServer;
   private tmux: TmuxManager;
   private instanceManager: ClaudeInstanceManager;
+  private configManager: LocalConfigManager;
+  private rateLimitDetector: RateLimitDetector;
   private git!: GitManager;
   private managerInstance?: ClaudeInstance;
   private isShuttingDown = false;
@@ -24,41 +28,55 @@ export class LocalOrchestrator {
 
   constructor(
     private config: OrchestratorConfig,
-    workspaceDir: string = '/tmp/orchestrator-workspace'
+    workspaceDir: string = '/tmp/orchestrator-workspace',
+    apiKeyConfigs: ApiKeyConfig[] = []
   ) {
     this.workspaceDir = workspaceDir;
     this.hookServer = new HookServer(config.hookServerPort);
     this.tmux = new TmuxManager();
     // Pass a mock docker manager since we're not using Docker
     this.instanceManager = new ClaudeInstanceManager(null as any, this.tmux);
+    this.configManager = new LocalConfigManager(apiKeyConfigs);
+    this.rateLimitDetector = new RateLimitDetector(
+      this.tmux,
+      this.instanceManager,
+      (instanceId) => this.handleRateLimit(instanceId)
+    );
   }
 
   async start(): Promise<void> {
     logger.info('Starting local orchestrator (no Docker)...');
 
     try {
-      // 1. Clean up any previous workspace
+      // 1. Initialize config manager (backup settings)
+      await this.configManager.initialize();
+
+      // 2. Clean up any previous workspace
       await this.cleanWorkspace();
 
-      // 2. Start hook server
+      // 3. Start hook server
       await this.hookServer.start();
 
-      // 3. Register hook handlers
+      // 4. Register hook handlers
       this.registerHandlers();
 
-      // 4. Clone repository
+      // 5. Clone repository
       await this.setupRepository();
 
-      // 5. Create Claude instances (tmux sessions)
+      // 6. Create Claude instances (tmux sessions)
       await this.createInstances();
 
-      // 6. Initialize manager
+      // 7. Start rate limit detector
+      this.rateLimitDetector.start(10000);
+
+      // 8. Initialize manager
       await this.initializeManager();
 
       logger.info('Local orchestrator started successfully', {
         workerCount: this.config.workerCount,
         hookPort: this.config.hookServerPort,
         workspace: this.workspaceDir,
+        configStats: this.configManager.getStats(),
       });
     } catch (err) {
       logger.error('Failed to start local orchestrator', err);
@@ -162,9 +180,55 @@ export class LocalOrchestrator {
         logger.error(`Instance ${instanceId} error`, error);
       },
       onRateLimit: (instanceId) => {
-        logger.warn(`Instance ${instanceId} rate limited`);
+        this.handleRateLimit(instanceId);
       },
     });
+  }
+
+  /**
+   * Handle rate limit - rotate config and restart instance.
+   */
+  private async handleRateLimit(instanceId: string): Promise<void> {
+    logger.warn(`Rate limit detected for ${instanceId}, rotating config...`);
+
+    const instance = this.instanceManager.getInstance(instanceId);
+    if (!instance) return;
+
+    // Save current task context
+    const savedTask = instance.currentTaskFull;
+
+    // Rotate config (OAuth -> API key -> OAuth)
+    const newConfig = await this.configManager.rotateConfig(instanceId);
+
+    if (!newConfig) {
+      logger.error(`All configs rate limited for ${instanceId}`);
+      return;
+    }
+
+    logger.info(`Rotated ${instanceId} to ${newConfig.type}${newConfig.name ? ` (${newConfig.name})` : ''}`);
+
+    // Interrupt current Claude session
+    await this.tmux.sendControlKey(instance.sessionName, 'C-c');
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    // Restart Claude (it will pick up the new settings.json)
+    await this.tmux.sendKeys(instance.sessionName, 'claude --dangerously-skip-permissions');
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    // Restore context
+    if (savedTask) {
+      const resumePrompt = `
+You were restarted due to rate limits. Your config was rotated to ${newConfig.type}.
+
+Your previous task was:
+${savedTask}
+
+Please resume this task. Check your recent file changes and git status.
+      `.trim();
+
+      await this.tmux.sendKeys(instance.sessionName, resumePrompt);
+      await this.tmux.sendKeys(instance.sessionName, '', true); // Enter
+    }
   }
 
   private async initializeManager(): Promise<void> {
@@ -304,9 +368,21 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
 
     logger.info('Shutting down local orchestrator...');
 
+    // Stop rate limit detector
+    this.rateLimitDetector.stop();
+
+    // Stop hook server
     await this.hookServer.stop();
+
+    // Kill tmux sessions
     await this.tmux.killAllOrchestratorSessions();
+
+    // Restore original Claude settings
+    await this.configManager.restore();
 
     logger.info('Local orchestrator shutdown complete');
   }
 }
+
+// Re-export ApiKeyConfig for convenience
+export { ApiKeyConfig } from '../claude/local-config-manager.js';

@@ -1,0 +1,201 @@
+/**
+ * Manages Claude Code configuration for local (non-Docker) mode.
+ * Alternates between OAuth (empty settings) and API key configs when rate limited.
+ */
+
+import { readFile, writeFile, copyFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
+import { logger } from '../utils/logger.js';
+
+export interface ApiKeyConfig {
+  name: string;
+  primaryApiKey: string;
+  apiKeySource?: string; // e.g., "z.ai", "anthropic", etc.
+}
+
+interface ConfigState {
+  type: 'oauth' | 'apikey';
+  configIndex?: number; // Which API key config is active
+  rateLimitedUntil?: Date;
+}
+
+export class LocalConfigManager {
+  private claudeSettingsPath: string;
+  private originalSettings: string | null = null;
+  private apiKeyConfigs: ApiKeyConfig[] = [];
+  private configStates: Map<string, ConfigState> = new Map(); // instanceId -> state
+  private rateLimitCooldownMinutes: number;
+
+  constructor(apiKeyConfigs: ApiKeyConfig[] = [], rateLimitCooldownMinutes: number = 60) {
+    this.claudeSettingsPath = join(homedir(), '.claude', 'settings.json');
+    this.apiKeyConfigs = apiKeyConfigs;
+    this.rateLimitCooldownMinutes = rateLimitCooldownMinutes;
+  }
+
+  /**
+   * Initialize - backup original settings.
+   */
+  async initialize(): Promise<void> {
+    if (existsSync(this.claudeSettingsPath)) {
+      this.originalSettings = await readFile(this.claudeSettingsPath, 'utf-8');
+      logger.info('Backed up original Claude settings');
+    } else {
+      this.originalSettings = '{}';
+    }
+
+    logger.info(`LocalConfigManager initialized`, {
+      apiKeyConfigs: this.apiKeyConfigs.length,
+      hasOAuth: true, // OAuth is always available as fallback
+    });
+  }
+
+  /**
+   * Get initial config for an instance - start with OAuth.
+   */
+  async assignConfig(instanceId: string): Promise<'oauth' | 'apikey'> {
+    // Start with OAuth (empty settings)
+    this.configStates.set(instanceId, { type: 'oauth' });
+    await this.applyOAuthConfig();
+    logger.info(`Instance ${instanceId} using OAuth authentication`);
+    return 'oauth';
+  }
+
+  /**
+   * Rotate config when rate limited.
+   * Alternates: OAuth -> API Key 1 -> API Key 2 -> ... -> OAuth
+   */
+  async rotateConfig(instanceId: string): Promise<{ type: 'oauth' | 'apikey'; name?: string } | null> {
+    const currentState = this.configStates.get(instanceId);
+
+    if (!currentState) {
+      return this.assignConfig(instanceId).then(type => ({ type }));
+    }
+
+    // Mark current config as rate limited
+    const cooldownUntil = new Date(Date.now() + this.rateLimitCooldownMinutes * 60 * 1000);
+
+    if (currentState.type === 'oauth') {
+      // OAuth rate limited, try first API key
+      if (this.apiKeyConfigs.length > 0) {
+        const config = this.apiKeyConfigs[0];
+        await this.applyApiKeyConfig(config);
+        this.configStates.set(instanceId, {
+          type: 'apikey',
+          configIndex: 0,
+          rateLimitedUntil: cooldownUntil
+        });
+        logger.info(`Instance ${instanceId} rotated to API key: ${config.name}`);
+        return { type: 'apikey', name: config.name };
+      } else {
+        // No API keys available, stay on OAuth (will hit rate limit again)
+        logger.warn(`Instance ${instanceId} has no API keys to rotate to`);
+        return null;
+      }
+    } else {
+      // API key rate limited, try next API key or fall back to OAuth
+      const nextIndex = (currentState.configIndex ?? 0) + 1;
+
+      if (nextIndex < this.apiKeyConfigs.length) {
+        const config = this.apiKeyConfigs[nextIndex];
+        await this.applyApiKeyConfig(config);
+        this.configStates.set(instanceId, {
+          type: 'apikey',
+          configIndex: nextIndex,
+          rateLimitedUntil: cooldownUntil
+        });
+        logger.info(`Instance ${instanceId} rotated to API key: ${config.name}`);
+        return { type: 'apikey', name: config.name };
+      } else {
+        // All API keys exhausted, check if OAuth cooldown expired
+        const oauthState = this.getOAuthCooldownState();
+        if (!oauthState || oauthState < new Date()) {
+          await this.applyOAuthConfig();
+          this.configStates.set(instanceId, { type: 'oauth' });
+          logger.info(`Instance ${instanceId} rotated back to OAuth`);
+          return { type: 'oauth' };
+        } else {
+          // All configs rate limited
+          logger.error(`Instance ${instanceId} - all configs rate limited`);
+          return null;
+        }
+      }
+    }
+  }
+
+  /**
+   * Apply OAuth config (empty/minimal settings).
+   */
+  private async applyOAuthConfig(): Promise<void> {
+    const oauthSettings = JSON.stringify({}, null, 2);
+    await writeFile(this.claudeSettingsPath, oauthSettings);
+    logger.debug('Applied OAuth config (empty settings)');
+  }
+
+  /**
+   * Apply API key config.
+   */
+  private async applyApiKeyConfig(config: ApiKeyConfig): Promise<void> {
+    const apiKeySettings = JSON.stringify({
+      primaryApiKey: config.primaryApiKey,
+    }, null, 2);
+    await writeFile(this.claudeSettingsPath, apiKeySettings);
+    logger.debug(`Applied API key config: ${config.name}`);
+  }
+
+  /**
+   * Get OAuth cooldown state (when it was last rate limited).
+   */
+  private getOAuthCooldownState(): Date | null {
+    for (const state of this.configStates.values()) {
+      if (state.type === 'oauth' && state.rateLimitedUntil) {
+        return state.rateLimitedUntil;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Get current config type for an instance.
+   */
+  getConfigType(instanceId: string): 'oauth' | 'apikey' | null {
+    return this.configStates.get(instanceId)?.type ?? null;
+  }
+
+  /**
+   * Get stats about config usage.
+   */
+  getStats(): {
+    instances: number;
+    usingOAuth: number;
+    usingApiKey: number;
+    availableApiKeys: number;
+  } {
+    const states = Array.from(this.configStates.values());
+    return {
+      instances: states.length,
+      usingOAuth: states.filter(s => s.type === 'oauth').length,
+      usingApiKey: states.filter(s => s.type === 'apikey').length,
+      availableApiKeys: this.apiKeyConfigs.length,
+    };
+  }
+
+  /**
+   * Restore original settings on shutdown.
+   */
+  async restore(): Promise<void> {
+    if (this.originalSettings !== null) {
+      await writeFile(this.claudeSettingsPath, this.originalSettings);
+      logger.info('Restored original Claude settings');
+    }
+  }
+
+  /**
+   * Add an API key config at runtime.
+   */
+  addApiKeyConfig(config: ApiKeyConfig): void {
+    this.apiKeyConfigs.push(config);
+    logger.info(`Added API key config: ${config.name}`);
+  }
+}

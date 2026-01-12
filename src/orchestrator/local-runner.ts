@@ -412,4 +412,4 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
 }
 
 // Re-export ApiKeyConfig for convenience
-export { ApiKeyConfig } from '../claude/local-config-manager.js';
+export type { ApiKeyConfig } from '../claude/local-config-manager.js';

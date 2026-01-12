@@ -2,19 +2,68 @@
 /**
  * End-to-End Test for Claude Code Orchestrator
  *
- * This test:
- * 1. Creates a unique test branch (e2e-{timestamp})
+ * This test validates the complete orchestration workflow by running real Claude
+ * instances against a test repository. It verifies that:
+ *
+ * - Manager and worker instances start correctly
+ * - Workers receive and complete tasks from PROJECT_DIRECTION.md
+ * - Workers commit and push changes to their branches
+ * - Merge queue processes worker branches correctly
+ * - Manager heartbeat keeps the system active
+ * - Graceful shutdown works properly
+ *
+ * ## Test Flow
+ *
+ * 1. Creates a unique test branch (e2e-{timestamp}) in the test repo
  * 2. Sets up a simple calculator project with PROJECT_DIRECTION.md
- * 3. Runs the orchestrator with real Claude instances
- * 4. Validates results after the test duration
+ * 3. Starts the orchestrator with configured workers
+ * 4. Runs for the specified duration while Claude instances work
+ * 5. Validates results (commits, files created, worker branches)
+ * 6. Reports success/failure with detailed metrics
  *
- * Usage:
- *   npx tsx tests/e2e/run-e2e.ts [--repo <repo>] [--duration <minutes>] [--workers <count>]
+ * ## Usage
  *
- * Requirements:
- *   - Git configured with push access to the test repo
- *   - Claude Code CLI installed
- *   - Valid auth config (OAuth or api-keys.json)
+ *   # Run with defaults (5 minutes, 2 workers, haiku model)
+ *   npm run test:e2e
+ *
+ *   # Run for 10 minutes with 3 workers
+ *   npm run test:e2e -- --duration 10 --workers 3
+ *
+ *   # Use a different model
+ *   npm run test:e2e -- --model sonnet
+ *
+ *   # Use custom auth config
+ *   npm run test:e2e -- --auth-config ~/my-auth-configs.json
+ *
+ * ## Options
+ *
+ *   -r, --repo <repo>         GitHub repo (default: mohsen1/claude-code-orchestrator-e2e-test)
+ *   -d, --duration <minutes>  Test duration in minutes (default: 5)
+ *   -w, --workers <count>     Number of workers (default: 2)
+ *   -m, --model <model>       Claude model: haiku, sonnet, opus (default: haiku)
+ *   -a, --auth-config <path>  Path to auth-configs.json for API key auth
+ *   --no-cleanup              Don't clean up tmux sessions after test
+ *
+ * ## Requirements
+ *
+ *   - Git configured with SSH push access to the test repo
+ *   - Claude Code CLI installed (`claude` command available)
+ *   - Valid authentication (OAuth via ~/.claude or API keys via auth-configs.json)
+ *   - tmux installed (for running Claude instances)
+ *
+ * ## Success Criteria
+ *
+ * The test passes if:
+ *   - At least one commit was made to the test branch
+ *   - WORKER_*_TASK_LIST.md files were created (indicates task distribution)
+ *
+ * ## Viewing Results
+ *
+ * After the test completes, visit the GitHub URL printed in the results to see:
+ *   - Commits made by workers
+ *   - Files created (src/*.ts)
+ *   - Worker branches (worker-1, worker-2, etc.)
+ *   - Task list files showing work distribution
  */
 
 import { execa } from 'execa';

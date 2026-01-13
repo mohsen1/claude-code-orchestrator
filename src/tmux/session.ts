@@ -170,6 +170,50 @@ export class TmuxManager {
   }
 
   /**
+   * Check if the session has pending input in the prompt buffer (text typed but not sent).
+   * Detects text after the ❯ prompt indicator on the same line or next line.
+   */
+  async hasPendingInput(sessionName: string): Promise<boolean> {
+    const content = await this.capturePane(sessionName, 10);
+    const lines = content.trim().split('\n');
+
+    // Look for lines with text after the Claude prompt indicator
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // Check if line has the prompt indicator followed by non-whitespace text
+      const promptMatch = line.match(/❯\s*(.+)/);
+      if (promptMatch && promptMatch[1].trim().length > 0) {
+        // Has text after prompt - this is pending input
+        return true;
+      }
+
+      // Also check for text between prompt line and the separator line
+      if (line.includes('───────') && i > 0) {
+        const prevLine = lines[i - 1].trim();
+        // If the previous line has content and isn't a prompt or separator
+        if (prevLine.length > 0 && !prevLine.includes('❯') && !prevLine.includes('───────') && !prevLine.includes('⏵⏵')) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Send just Enter key to submit pending input.
+   */
+  async sendEnter(sessionName: string): Promise<void> {
+    try {
+      await execa('tmux', ['send-keys', '-t', sessionName, 'Enter']);
+      logger.debug(`Sent Enter to ${sessionName}`);
+    } catch (err) {
+      logger.error(`Failed to send Enter to ${sessionName}`, err);
+      throw err;
+    }
+  }
+
+  /**
    * Ensure Claude is running in the session. Restart if dropped to shell.
    * @param model - Optional model to use when restarting
    */

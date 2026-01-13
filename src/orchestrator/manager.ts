@@ -815,10 +815,23 @@ If action needed: Take the action, then STOP.
           ? Date.now() - instance.lastToolUse.getTime()
           : Date.now() - instance.createdAt.getTime();
 
-        // If worker has been idle for more than 2 minutes, prompt them to continue
-        if (idleTime > 120000) {
+        // If worker has been idle for more than 1 minute, prompt them to continue
+        if (idleTime > 60000) {
           logger.info(`Worker ${instance.workerId} idle for ${Math.round(idleTime / 60000)}m, prompting to continue`);
           await this.promptWorkerToContinue(instance.workerId);
+        }
+      }
+    }
+
+    // Check for workers at prompt but marked as 'ready' (just started but not working)
+    if (instance.type === 'worker' && instance.status === 'ready') {
+      const atPrompt = await this.tmux.isAtClaudePrompt(sessionName);
+      if (atPrompt) {
+        const timeSinceCreation = Date.now() - instance.createdAt.getTime();
+        // If worker has been in 'ready' state for over 30 seconds at prompt, nudge them
+        if (timeSinceCreation > 30000) {
+          logger.info(`Worker ${instance.workerId} stuck in ready state, initializing`);
+          await this.initializeWorker(instance.workerId);
         }
       }
     }
@@ -832,6 +845,16 @@ If action needed: Take the action, then STOP.
       } else {
         await this.tmux.sendKeys(sessionName, confirmKey, true);
       }
+      return;
+    }
+
+    // Check for pending input in prompt buffer (text typed but not submitted)
+    const hasPendingInput = await this.tmux.hasPendingInput(sessionName);
+    if (hasPendingInput) {
+      logger.info(`Instance ${instance.id} has pending input in prompt buffer, sending Enter`);
+      await this.tmux.sendEnter(sessionName);
+      instance.lastToolUse = new Date(); // Reset timer
+      return;
     }
   }
 

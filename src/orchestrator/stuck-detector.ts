@@ -129,6 +129,14 @@ export class StuckDetector {
         return;
       }
 
+      // Check for pending input in prompt buffer (text typed but not sent)
+      const hasPendingInput = await this.tmux.hasPendingInput(sessionName);
+      if (hasPendingInput) {
+        logger.info(`Instance ${instanceId} has pending input, sending Enter`);
+        await this.tmux.sendEnter(sessionName);
+        return;
+      }
+
       // Check if at Claude prompt (waiting for input but nothing sent)
       const atPrompt = await this.tmux.isAtClaudePrompt(sessionName);
       if (atPrompt) {

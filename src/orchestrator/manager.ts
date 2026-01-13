@@ -686,7 +686,15 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
    git push origin ${this.config.branch}
    \`\`\`
 
-6. **Update task list**: Move completed task to "Completed", set next "Current Task"
+6. **Update task list**:
+   - Read WORKER_${workerId}_TASK_LIST.md
+   - Move completed task to "Completed" section
+   - If Queue is empty, **CREATE NEW TASKS** based on PROJECT_DIRECTION.md priorities:
+     * Parser Squad: Fix TS1005/TS1109 false positives
+     * Binder Squad: Fix TS2304 error poisoning, lib.d.ts integration
+     * CFA Squad: Edge cases for TS2564/TS2454
+     * Solver Squad: TS2322, TS7006 strictness
+   - Set next "Current Task" from Queue
 
 7. **Commit and push task update**
 
@@ -758,12 +766,27 @@ HEARTBEAT CHECK - Perform routine maintenance. NEVER ask questions, just act.
 **IMPORTANT**: Stay in ${this.workspaceDir} - NEVER cd into worker directories.
 
 1. **Verify your branch**: \`git status --short\` (must show "On branch ${this.config.branch}")
-2. **Check for pending merges**: \`git fetch --all && git branch -r | grep worker\`
-3. **Review worker progress**: Read WORKER_*_TASK_LIST.md files to see current tasks
-4. **Merge pending work**: If any worker branch has commits ahead, merge it:
-   - \`git diff ${this.config.branch}...origin/worker-N --stat\`
-   - \`git merge origin/worker-N --no-ff -m "Merge worker-N"\`
-   - \`git push origin ${this.config.branch}\`
+
+2. **Check for pending merges**: \`git fetch --all\`
+   For each worker branch with commits ahead of ${this.config.branch}, merge it.
+
+3. **Check for idle workers needing tasks**:
+   \`\`\`bash
+   for i in {1..${this.config.workerCount}}; do
+     if grep -q "All tasks completed\\|Queue\\s*(none)" WORKER_\${i}_TASK_LIST.md 2>/dev/null; then
+       echo "Worker $i needs new tasks"
+     fi
+   done
+   \`\`\`
+
+4. **Assign new tasks to idle workers**:
+   - Read PROJECT_DIRECTION.md for priorities
+   - Update WORKER_N_TASK_LIST.md with new tasks from the priority list:
+     * Parser Squad: Fix TS1005/TS1109 false positives
+     * Binder Squad: Fix TS2304 error poisoning
+     * CFA Squad: Edge cases for TS2564/TS2454
+     * Solver Squad: TS2322, TS7006 strictness
+   - Commit and push updated task lists
 
 If everything looks good: Output a one-line status and STOP.
 If action needed: Take the action, then STOP.

@@ -573,7 +573,6 @@ Start now: Sync with ${this.config.branch}, then read your task list.
   }
 
   private async notifyManagerOfCompletion(workerId: number): Promise<void> {
-    const workerWorktree = `${this.workspaceDir}/worktrees/worker-${workerId}`;
     const prompt = `
 ## Worker ${workerId} Completed
 
@@ -581,8 +580,8 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
 
 ## CRITICAL RULES
 - **NEVER ask questions** - make decisions and act
-- **NEVER say "Worker must..."** - YOU handle problems or send the worker a fix command
-- **If merge conflicts or deletions detected** - reset the worker's branch and tell them to re-pull
+- **YOU resolve conflicts** - don't tell workers to fix things, fix them yourself
+- **Be decisive** - pick the best resolution and move forward
 
 ## Your Actions
 
@@ -592,29 +591,33 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
    git diff ${this.config.branch}...origin/worker-${workerId} --stat
    \`\`\`
 
-2. **Check for problems** (deletions of existing files, conflicts):
-   - If worker's branch DELETES files that exist on ${this.config.branch}, DO NOT MERGE
-   - Instead, reset the worker and tell them to re-pull:
-     \`\`\`bash
-     # In worker's worktree, reset to latest ${this.config.branch}
-     cd ${workerWorktree}
-     git fetch origin
-     git reset --hard origin/${this.config.branch}
-     git push origin worker-${workerId} --force
-     \`\`\`
-   - Then STOP - the worker will get a new prompt to continue
-
-3. **If clean merge possible**:
+2. **Attempt merge**:
    \`\`\`bash
    git merge origin/worker-${workerId} --no-ff -m "Merge worker-${workerId}"
+   \`\`\`
+
+3. **If merge conflicts occur, RESOLVE THEM**:
+   - For each conflicted file, examine the conflict markers
+   - Use your judgment to combine both changes intelligently
+   - If worker's changes are clearly better: \`git checkout --theirs <file>\`
+   - If existing changes should win: \`git checkout --ours <file>\`
+   - For complex conflicts: edit the file to include both changes properly
+   - After resolving: \`git add <resolved-files> && git commit -m "Merge worker-${workerId} (resolved conflicts)"\`
+
+4. **If worker deleted files that shouldn't be deleted**:
+   - Restore them: \`git checkout HEAD -- <file>\`
+   - Then complete the merge
+
+5. **Push the merged result**:
+   \`\`\`bash
    git push origin ${this.config.branch}
    \`\`\`
 
-4. **Update task list**: Move completed task to "Completed", set next "Current Task"
+6. **Update task list**: Move completed task to "Completed", set next "Current Task"
 
-5. **Commit and push task update**
+7. **Commit and push task update**
 
-6. **STOP**
+8. **STOP**
     `.trim();
 
     await this.instanceManager.sendPrompt('manager', prompt);

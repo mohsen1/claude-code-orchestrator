@@ -448,13 +448,14 @@ You are the **Manager** instance of a Claude Code Orchestrator.
 - Working directory: ${this.workspaceDir}
 - **Target branch: ${this.config.branch}** (all merges go here)
 - Worker instances: ${this.config.workerCount} workers
-- Workers have worktrees at: ${this.workspaceDir}/worktrees/worker-{N}
 
 ## CRITICAL RULES
 1. **NEVER ask questions** - make decisions autonomously
 2. **NEVER output instructions for others** - take action yourself or send prompts to workers
 3. **Event-driven** - complete your task and STOP, you'll get new prompts when workers finish
 4. **Be decisive** - if something is unclear, make a reasonable choice and proceed
+5. **NEVER cd into worker directories** - ALWAYS stay in ${this.workspaceDir}
+6. **ALWAYS verify you're on ${this.config.branch}** - run \`git status --short\` before any git operation
 
 ## Your Task Now
 
@@ -623,8 +624,15 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
 - **NEVER ask questions** - make decisions and act
 - **YOU resolve conflicts** - don't tell workers to fix things, fix them yourself
 - **Be decisive** - pick the best resolution and move forward
+- **STAY in ${this.workspaceDir}** - NEVER cd into worker directories
 
 ## Your Actions
+
+0. **Verify you're in the right place**:
+   \`\`\`bash
+   pwd  # Must show: ${this.workspaceDir}
+   git status --short  # Must show: On branch ${this.config.branch}
+   \`\`\`
 
 1. **Fetch and review**:
    \`\`\`bash
@@ -723,10 +731,15 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
     const heartbeatPrompt = `
 HEARTBEAT CHECK - Perform routine maintenance. NEVER ask questions, just act.
 
-1. **Check branches**: \`git fetch --all && git branch -r | grep worker\`
-2. **Review pending merges**: If any worker branch is ahead, merge it (follow standard merge process)
-3. **Check worker progress**: Read WORKER_*_TASK_LIST.md files to see current tasks
-4. **Sync workers if needed**: If a worker's branch is behind ${this.config.branch}, their worktree needs a pull
+**IMPORTANT**: Stay in ${this.workspaceDir} - NEVER cd into worker directories.
+
+1. **Verify your branch**: \`git status --short\` (must show "On branch ${this.config.branch}")
+2. **Check for pending merges**: \`git fetch --all && git branch -r | grep worker\`
+3. **Review worker progress**: Read WORKER_*_TASK_LIST.md files to see current tasks
+4. **Merge pending work**: If any worker branch has commits ahead, merge it:
+   - \`git diff ${this.config.branch}...origin/worker-N --stat\`
+   - \`git merge origin/worker-N --no-ff -m "Merge worker-N"\`
+   - \`git push origin ${this.config.branch}\`
 
 If everything looks good: Output a one-line status and STOP.
 If action needed: Take the action, then STOP.

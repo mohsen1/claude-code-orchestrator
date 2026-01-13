@@ -151,8 +151,8 @@ export class Orchestrator {
     logger.info('Starting host-native orchestrator...');
 
     try {
-      // 1. Clean up any previous workspace
-      await this.cleanWorkspace();
+      // 1. Check if we can resume from existing workspace
+      const canResume = await this.canResumeFromExisting();
 
       // 2. Start hook server
       await this.hookServer.start();
@@ -160,22 +160,35 @@ export class Orchestrator {
       // 3. Register hook handlers
       this.registerHandlers();
 
-      // 4. Clone repository and set up worktrees
-      await this.setupRepository();
+      if (canResume) {
+        // Resume mode: reuse existing workspace
+        logger.info('Resuming from existing workspace...');
+        await this.resumeFromExisting();
+      } else {
+        // Fresh start: clean and clone
+        logger.info('Starting fresh (no existing workspace found)...');
+        await this.cleanWorkspace();
+        await this.setupRepository();
+      }
 
-      // 5. Create Claude instances (tmux sessions)
-      await this.createInstances();
+      // 4. Create or reconnect Claude instances (tmux sessions)
+      await this.createInstances(canResume);
 
-      // 6. Start monitors
+      // 5. Start monitors
       this.rateLimitDetector.start(10000);
       this.stuckDetector.start(60000);
       this.startReconcileLoop(30000);
       this.startManagerHeartbeat(this.config.managerHeartbeatIntervalMs);
 
-      // 7. Initialize manager
-      await this.initializeManager();
+      // 6. Initialize or resume instances
+      if (canResume) {
+        await this.resumeInstances();
+      } else {
+        await this.initializeManager();
+      }
 
       logger.info('Orchestrator started successfully', {
+        mode: canResume ? 'resumed' : 'fresh',
         workerCount: this.config.workerCount,
         hookPort: this.config.hookServerPort,
         workspace: this.workspaceDir,
@@ -189,6 +202,164 @@ export class Orchestrator {
       await this.shutdown();
       throw err;
     }
+  }
+
+  /**
+   * Check if we can resume from an existing workspace.
+   * Returns true if workspace exists and is a valid git repo with the right branch.
+   */
+  private async canResumeFromExisting(): Promise<boolean> {
+    try {
+      // Check if workspace directory exists
+      if (!existsSync(this.workspaceDir)) {
+        logger.debug('Workspace does not exist');
+        return false;
+      }
+
+      // Check if it's a git repo
+      const gitDir = join(this.workspaceDir, '.git');
+      if (!existsSync(gitDir)) {
+        logger.debug('Workspace is not a git repo');
+        return false;
+      }
+
+      // Check if we're on the right branch
+      const result = await execa('git', ['-C', this.workspaceDir, 'branch', '--show-current'], { reject: false });
+      if (result.exitCode !== 0) {
+        logger.debug('Could not get current branch');
+        return false;
+      }
+
+      const currentBranch = result.stdout.trim();
+      if (currentBranch !== this.config.branch) {
+        logger.debug(`Wrong branch: ${currentBranch} (expected ${this.config.branch})`);
+        return false;
+      }
+
+      // Check if worktrees directory exists
+      const worktreesDir = join(this.workspaceDir, 'worktrees');
+      if (!existsSync(worktreesDir)) {
+        logger.debug('Worktrees directory does not exist');
+        return false;
+      }
+
+      // Check if at least worker-1 worktree exists
+      const worker1Dir = join(worktreesDir, 'worker-1');
+      if (!existsSync(worker1Dir)) {
+        logger.debug('Worker-1 worktree does not exist');
+        return false;
+      }
+
+      logger.info('Found existing workspace, will resume');
+      return true;
+    } catch (err) {
+      logger.debug('Error checking existing workspace', err);
+      return false;
+    }
+  }
+
+  /**
+   * Resume from existing workspace - pull latest and sync worktrees.
+   */
+  private async resumeFromExisting(): Promise<void> {
+    logger.info('Pulling latest changes in main workspace...');
+
+    this.git = new GitManager(this.workspaceDir);
+
+    // Pull latest on main workspace
+    await execa('git', ['-C', this.workspaceDir, 'fetch', 'origin'], { reject: false });
+    await execa('git', ['-C', this.workspaceDir, 'reset', '--hard', `origin/${this.config.branch}`], { reject: false });
+
+    // Copy env files to main workspace (in case they changed)
+    await this.copyConfigEnvFiles(this.workspaceDir);
+
+    // Sync each worker worktree
+    const worktreesDir = join(this.workspaceDir, 'worktrees');
+    for (let i = 1; i <= this.config.workerCount; i++) {
+      const worktreePath = join(worktreesDir, `worker-${i}`);
+
+      if (existsSync(worktreePath)) {
+        // Worktree exists - just sync it
+        logger.debug(`Syncing existing worktree for worker-${i}`);
+        await execa('git', ['-C', worktreePath, 'fetch', 'origin'], { reject: false });
+        await execa('git', ['-C', worktreePath, 'reset', '--hard', `origin/${this.config.branch}`], { reject: false });
+        await this.copyEnvFiles(this.workspaceDir, worktreePath);
+      } else {
+        // Worktree missing - create it
+        logger.info(`Creating missing worktree for worker-${i}`);
+        const branchName = `worker-${i}`;
+        await execa('git', ['-C', this.workspaceDir, 'branch', branchName], { reject: false });
+        await execa('git', ['-C', this.workspaceDir, 'worktree', 'add', worktreePath, branchName]);
+        await this.copyEnvFiles(this.workspaceDir, worktreePath);
+      }
+    }
+
+    logger.info('Workspace sync complete');
+  }
+
+  /**
+   * Resume existing Claude instances - reconnect to tmux sessions or restart Claude.
+   */
+  private async resumeInstances(): Promise<void> {
+    logger.info('Resuming Claude instances...');
+
+    // Wait for Claude to initialize in sessions
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Resume manager
+    const managerPrompt = `
+## ORCHESTRATOR RESUMED
+
+The orchestrator has been restarted. Resume your work.
+
+**Your role:** Manager - coordinate workers and merge their work.
+
+**Immediate actions:**
+1. Check current branch: \`git status --short\`
+2. Pull latest: \`git fetch origin && git reset --hard origin/${this.config.branch}\`
+3. Check for pending worker merges: \`git branch -r | grep worker\`
+4. Check which workers need tasks: Look at WORKER_*_TASK_LIST.md files
+5. Take appropriate action (merge pending work or assign new tasks)
+6. STOP when done
+
+Continue working autonomously. NEVER ask questions.
+    `.trim();
+
+    await this.instanceManager.sendPrompt('manager', managerPrompt);
+
+    // Resume workers with staggered prompts
+    for (let i = 1; i <= this.config.workerCount; i++) {
+      await this.resumeWorker(i);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+
+    logger.info('All instances resumed');
+  }
+
+  /**
+   * Resume a single worker instance.
+   */
+  private async resumeWorker(workerId: number): Promise<void> {
+    const worktreePath = `${this.workspaceDir}/worktrees/worker-${workerId}`;
+
+    const prompt = `
+## ORCHESTRATOR RESUMED
+
+The orchestrator has been restarted. Resume your work.
+
+**Your role:** Worker ${workerId}
+
+**Immediate actions:**
+1. Sync with latest: \`git fetch origin && git reset --hard origin/${this.config.branch}\`
+2. Read your task list: \`cat WORKER_${workerId}_TASK_LIST.md\`
+3. Work on your Current Task
+4. When done: commit, push to worker-${workerId}, and STOP
+
+Continue working autonomously. NEVER ask questions.
+    `.trim();
+
+    await this.instanceManager.sendPrompt(`worker-${workerId}`, prompt);
+    logger.debug(`Worker ${workerId} resume prompt sent`);
   }
 
   private async cleanWorkspace(): Promise<void> {
@@ -298,29 +469,31 @@ export class Orchestrator {
     }
   }
 
-  private async createInstances(): Promise<void> {
-    // Create manager instance (uses OAuth by default)
-    await this.createInstance('manager', 'manager', 0, this.workspaceDir);
+  private async createInstances(resumeMode: boolean = false): Promise<void> {
+    // Create or reconnect manager instance
+    await this.createInstance('manager', 'manager', 0, this.workspaceDir, undefined, resumeMode);
 
-    // Create worker instances
+    // Create or reconnect worker instances
     for (let i = 1; i <= this.config.workerCount; i++) {
       const worktreePath = `${this.workspaceDir}/worktrees/worker-${i}`;
-      await this.createInstance(`worker-${i}`, 'worker', i, worktreePath);
+      await this.createInstance(`worker-${i}`, 'worker', i, worktreePath, undefined, resumeMode);
     }
 
-    logger.info(`Created ${this.config.workerCount + 1} Claude instances`);
+    logger.info(`${resumeMode ? 'Reconnected to' : 'Created'} ${this.config.workerCount + 1} Claude instances`);
   }
 
   /**
    * Create a Claude instance with optional auth config override.
    * If no authConfig is provided, Claude uses host OAuth.
+   * In resume mode, reconnects to existing tmux session if it exists.
    */
   private async createInstance(
     id: string,
     type: 'manager' | 'worker',
     workerId: number,
     workDir: string,
-    authConfig?: AuthConfig
+    authConfig?: AuthConfig,
+    resumeMode: boolean = false
   ): Promise<ClaudeInstance> {
     const sessionName = `claude-${id}`;
 
@@ -343,8 +516,22 @@ export class Orchestrator {
     await writeFile(settingsPath, JSON.stringify(settings, null, 2));
     logger.debug(`Wrote hooks to settings.json`, { path: settingsPath });
 
-    // Create tmux session with env vars and start Claude
-    await this.tmux.createSessionWithClaude(sessionName, workDir, env, this.config.model);
+    // In resume mode, check if tmux session already exists
+    if (resumeMode) {
+      const sessionExists = await this.tmux.sessionExists(sessionName);
+      if (sessionExists) {
+        logger.info(`Reconnecting to existing session: ${sessionName}`);
+        // Ensure Claude is running in the session
+        await this.tmux.ensureClaudeRunning(sessionName, workDir, this.config.model);
+      } else {
+        // Session doesn't exist, create it
+        logger.info(`Session ${sessionName} not found, creating new one`);
+        await this.tmux.createSessionWithClaude(sessionName, workDir, env, this.config.model);
+      }
+    } else {
+      // Fresh mode: always create new session
+      await this.tmux.createSessionWithClaude(sessionName, workDir, env, this.config.model);
+    }
 
     const instance: ClaudeInstance = {
       id,
@@ -360,7 +547,7 @@ export class Orchestrator {
     };
 
     this.instanceManager.addInstance(instance);
-    logger.info(`Created instance: ${id}`, {
+    logger.info(`${resumeMode ? 'Reconnected to' : 'Created'} instance: ${id}`, {
       workDir,
       authConfig: authConfig?.name ?? 'OAuth',
     });

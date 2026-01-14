@@ -25,24 +25,97 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { logger, configureLogDirectory } from '../utils/logger.js';
 
+/**
+ * Item in a merge queue with attempt tracking
+ */
+export interface QueueItem {
+  id: number;
+  attemptCount: number;
+  enqueuedAt: number;
+}
+
+/**
+ * Persistent queue state for recovery after crashes
+ */
+export interface QueueState {
+  queue: QueueItem[];
+  lastProcessTime: number;
+  version: number; // for future schema migrations
+}
+
 const ENV_FILES = ['.env', '.env.local'];
 
 /**
  * Queue for manager merge operations.
  * Prevents multiple workers from overwhelming the manager simultaneously.
+ * Includes persistence to survive process restarts and tracks attempts for failure handling.
  */
-class MergeQueue {
-  private queue: number[] = [];
+export class MergeQueue {
+  private queue: QueueItem[] = [];
   private isProcessing = false;
   private lastProcessTime = 0;
   private static readonly MIN_PROCESS_INTERVAL_MS = 30000; // 30 seconds between merge notifications
+  private static readonly MAX_ATTEMPTS = 3; // Max retry attempts before escalation
 
-  constructor(private processFunc: (workerId: number) => Promise<void>) {}
+  constructor(
+    private processFunc: (workerId: number) => Promise<void>,
+    private statePath?: string,
+    private onMaxAttemptsExceeded?: (workerId: number) => Promise<void>
+  ) {}
+
+  /**
+   * Load queue state from disk if available
+   */
+  async loadState(): Promise<void> {
+    if (!this.statePath || !existsSync(this.statePath)) {
+      return;
+    }
+
+    try {
+      const data = await readFile(this.statePath, 'utf-8');
+      const state: QueueState = JSON.parse(data);
+      
+      if (state.version === 1) {
+        this.queue = state.queue;
+        this.lastProcessTime = state.lastProcessTime;
+        logger.info(`Merge queue: restored ${this.queue.length} items from ${this.statePath}`);
+      }
+    } catch (err) {
+      logger.warn('Failed to load merge queue state', err);
+    }
+  }
+
+  /**
+   * Save queue state to disk
+   */
+  private async saveState(): Promise<void> {
+    if (!this.statePath) {
+      return;
+    }
+
+    try {
+      const state: QueueState = {
+        queue: this.queue,
+        lastProcessTime: this.lastProcessTime,
+        version: 1
+      };
+      await writeFile(this.statePath, JSON.stringify(state, null, 2), 'utf-8');
+    } catch (err) {
+      logger.error('Failed to save merge queue state', err);
+    }
+  }
 
   enqueue(workerId: number): void {
-    if (!this.queue.includes(workerId)) {
-      this.queue.push(workerId);
+    // Check if already in queue
+    const existing = this.queue.find(item => item.id === workerId);
+    if (!existing) {
+      this.queue.push({
+        id: workerId,
+        attemptCount: 0,
+        enqueuedAt: Date.now()
+      });
       logger.info(`Merge queue: added worker-${workerId} (queue size: ${this.queue.length})`);
+      this.saveState().catch(err => logger.error('Failed to save queue state after enqueue', err));
     }
   }
 
@@ -57,15 +130,39 @@ class MergeQueue {
     }
 
     this.isProcessing = true;
-    const workerId = this.queue.shift()!;
+    const item = this.queue.shift()!;
+    let success = false;
 
     try {
-      logger.info(`Merge queue: processing worker-${workerId} (${this.queue.length} remaining)`);
-      await this.processFunc(workerId);
+      logger.info(`Merge queue: processing worker-${item.id} (attempt ${item.attemptCount + 1}/${MergeQueue.MAX_ATTEMPTS}, ${this.queue.length} remaining)`);
+      await this.processFunc(item.id);
+      success = true;
       this.lastProcessTime = Date.now();
+      await this.saveState();
     } catch (err) {
-      logger.error(`Merge queue: failed to process worker-${workerId}`, err);
-      this.queue.unshift(workerId);
+      logger.error(`Merge queue: failed to process worker-${item.id}`, err);
+      
+      // Increment attempt count
+      item.attemptCount++;
+      
+      if (item.attemptCount >= MergeQueue.MAX_ATTEMPTS) {
+        logger.error(`Merge queue: worker-${item.id} exceeded max attempts (${MergeQueue.MAX_ATTEMPTS}), escalating`);
+        
+        // Call escalation handler if provided
+        if (this.onMaxAttemptsExceeded) {
+          try {
+            await this.onMaxAttemptsExceeded(item.id);
+          } catch (escalationErr) {
+            logger.error(`Failed to escalate worker-${item.id}`, escalationErr);
+          }
+        }
+      } else {
+        // Re-enqueue for retry
+        logger.info(`Merge queue: re-enqueueing worker-${item.id} (attempt ${item.attemptCount}/${MergeQueue.MAX_ATTEMPTS})`);
+        this.queue.unshift(item);
+      }
+      
+      await this.saveState();
     } finally {
       this.isProcessing = false;
     }
@@ -77,6 +174,27 @@ class MergeQueue {
 
   isCurrentlyProcessing(): boolean {
     return this.isProcessing;
+  }
+
+  /**
+   * Get the age in milliseconds of the oldest item in the queue
+   */
+  getOldestItemAge(): number | null {
+    if (this.queue.length === 0) return null;
+    const oldest = this.queue[0];
+    return Date.now() - oldest.enqueuedAt;
+  }
+
+  /**
+   * Get queue items for health monitoring
+   */
+  getQueueItems(): Array<{ id: number; attemptCount: number; ageMs: number }> {
+    const now = Date.now();
+    return this.queue.map(item => ({
+      id: item.id,
+      attemptCount: item.attemptCount,
+      ageMs: now - item.enqueuedAt
+    }));
   }
 }
 
@@ -115,6 +233,7 @@ export class Orchestrator {
   private reconcileInterval: NodeJS.Timeout | null = null;
   private managerHeartbeatInterval: NodeJS.Timeout | null = null;
   private directorHeartbeatInterval: NodeJS.Timeout | null = null;
+  private queueHealthInterval: NodeJS.Timeout | null = null;
   private isShuttingDown = false;
   private workspaceDir: string;
   private startTimestamp: Date | null = null;
@@ -135,7 +254,6 @@ export class Orchestrator {
   private logBaseDir: string;
   private runLogDir: string | null;
   private logsInitialized = false;
-  private uiBuildDir: string | null;
 
   constructor(
     private config: OrchestratorConfig,
@@ -151,13 +269,9 @@ export class Orchestrator {
     this.authRotationIndex = 0;
     this.useHierarchy = this.config.workerCount > this.config.engineerManagerGroupSize;
     this.logBaseDir = this.config.logDirectory ?? workspaceDir;
-    this.uiBuildDir = this.resolveUiBuildDir();
 
     // Initialize components
-    this.hookServer = new HookServer(config.serverPort, {
-      sessionProvider: () => this.getSessionSnapshot(),
-      uiDir: this.uiBuildDir,
-    });
+    this.hookServer = new HookServer(config.serverPort);
     this.tmux = new TmuxManager();
     this.instanceManager = new ClaudeInstanceManager(this.tmux);
 
@@ -182,10 +296,12 @@ export class Orchestrator {
 
     if (this.useHierarchy) {
       this.initializeTeams();
-      this.directorMergeQueue = new MergeQueue((teamId) => this.notifyDirectorOfCompletion(teamId));
+      const directorQueueStatePath = this.runLogDir ? join(this.runLogDir, 'director-queue-state.json') : undefined;
+      this.directorMergeQueue = new MergeQueue((teamId) => this.notifyDirectorOfCompletion(teamId), directorQueueStatePath);
     } else {
       this.directorMergeQueue = null;
-      this.managerMergeQueue = new MergeQueue((workerId) => this.notifyManagerOfCompletion(workerId));
+      const managerQueueStatePath = this.runLogDir ? join(this.runLogDir, 'manager-queue-state.json') : undefined;
+      this.managerMergeQueue = new MergeQueue((workerId) => this.notifyManagerOfCompletion(workerId), managerQueueStatePath);
     }
   }
 
@@ -204,6 +320,11 @@ export class Orchestrator {
       // 3. Register hook handlers
       this.registerHandlers();
 
+      // 4. Load persisted queue states if resuming
+      if (canResume) {
+        await this.loadAllQueueStates();
+      }
+
       if (canResume) {
         // Resume mode: reuse existing workspace
         logger.info('Resuming from existing workspace...');
@@ -215,20 +336,21 @@ export class Orchestrator {
         await this.setupRepository();
       }
 
-      // 4. Create or reconnect Claude instances (tmux sessions)
+      // 5. Create or reconnect Claude instances (tmux sessions)
       await this.createInstances(canResume);
 
-      // 5. Start monitors
+      // 6. Start monitors
       this.rateLimitDetector.start(10000);
       this.stuckDetector.start(60000);
       this.startReconcileLoop(30000);
+      this.startQueueHealthMonitor(120000); // Check every 2 minutes
       if (this.useHierarchy) {
         this.startDirectorHeartbeat(this.config.managerHeartbeatIntervalMs);
       } else {
         this.startManagerHeartbeat(this.config.managerHeartbeatIntervalMs);
       }
 
-      // 6. Initialize or resume instances
+      // 7. Initialize or resume instances
       if (canResume) {
         await this.resumeInstances();
       } else if (this.useHierarchy) {
@@ -252,6 +374,26 @@ export class Orchestrator {
       logger.error('Failed to start orchestrator', err);
       await this.shutdown();
       throw err;
+    }
+  }
+
+  /**
+   * Load persisted queue states when resuming a run
+   */
+  private async loadAllQueueStates(): Promise<void> {
+    try {
+      if (this.directorMergeQueue) {
+        await this.directorMergeQueue.loadState();
+      }
+      if (this.managerMergeQueue) {
+        await this.managerMergeQueue.loadState();
+      }
+      for (const team of this.teams) {
+        await team.mergeQueue.loadState();
+      }
+      logger.info('Queue states loaded from disk');
+    } catch (err) {
+      logger.error('Failed to load queue states', err);
     }
   }
 
@@ -580,6 +722,7 @@ Continue working autonomously. NEVER ask questions.
   private buildTeamMetadata(teamId: number, workerIds: number[]): EngineeringTeam {
     const branchName = `em-team-${teamId}`;
     const worktreePath = join(this.workspaceDir, 'worktrees', `em-${teamId}`);
+    const queueStatePath = this.runLogDir ? join(this.runLogDir, `team-${teamId}-queue-state.json`) : undefined;
     return {
       id: teamId,
       workerIds,
@@ -587,7 +730,7 @@ Continue working autonomously. NEVER ask questions.
       worktreePath,
       emInstanceId: `em-${teamId}`,
       status: 'active',
-      mergeQueue: new MergeQueue((workerId) => this.notifyEngineeringManagerOfCompletion(teamId, workerId)),
+      mergeQueue: new MergeQueue((workerId) => this.notifyEngineeringManagerOfCompletion(teamId, workerId), queueStatePath),
       lastAssessment: Date.now(),
       priorityScore: 0,
     };
@@ -916,23 +1059,91 @@ Please resume. Check git status and recent changes.
   }
 
   private async handleStuckInstance(instanceId: string): Promise<void> {
-    logger.warn(`Instance ${instanceId} stuck, nudging...`);
+    logger.error(`Instance ${instanceId} permanently stuck after multiple recovery attempts. Restarting...`);
 
     const instance = this.instanceManager.getInstance(instanceId);
     if (!instance) return;
 
-    const nudgePrompt = `
-## Nudge: Are you stuck?
+    try {
+      // If it's a worker, notify the EM about the stuck worker
+      const workerId = this.parseWorkerId(instanceId);
+      if (workerId !== null) {
+        const team = this.getTeamForWorker(workerId);
+        if (team) {
+          const emInstance = this.instanceManager.getInstance(team.emInstanceId);
+          if (emInstance) {
+            const notifyPrompt = `
+## ALERT: Worker-${workerId} is stuck and being restarted
 
-It appears you haven't used any tools recently. If you're:
-- **Thinking**: Continue your analysis and take action
-- **Waiting**: The system is automated, proceed with your task
-- **Blocked**: Commit what you have, push, and stop
+Worker-${workerId} became unresponsive and didn't respond to recovery attempts.
+The orchestrator is restarting the worker's session.
 
-Please continue working.
-    `.trim();
+**Actions you should take:**
+1. Review the worker's branch to see what they were working on
+2. Check if any partial work needs to be salvaged or discarded
+3. Reassign or adjust priorities if needed
 
-    await this.instanceManager.sendPrompt(instanceId, nudgePrompt);
+The worker will resume from their branch state after restart.
+            `.trim();
+            
+            await this.instanceManager.sendPrompt(team.emInstanceId, notifyPrompt);
+            logger.info(`Notified EM-${team.id} about stuck worker-${workerId}`);
+          }
+        }
+      }
+
+      // Save context before restart
+      const savedTask = instance.currentTaskFull;
+      const savedWorkDir = instance.workDir;
+      const savedType = instance.type;
+      const savedWorkerId = instance.workerId;
+
+      // Determine auth config (rotate to avoid hitting same rate limit)
+      const nextAuth = this.getNextAuthConfig();
+
+      // Kill current session completely
+      logger.info(`Killing stuck instance ${instanceId} session`);
+      await this.tmux.killSession(instance.sessionName);
+      this.instanceManager.removeInstance(instanceId);
+      
+      // Wait a moment for cleanup
+      await new Promise(r => setTimeout(r, 2000));
+      
+      // Re-create the instance with fresh session
+      await this.createInstance(
+        instanceId,
+        savedType,
+        savedWorkerId,
+        savedWorkDir,
+        nextAuth ?? undefined
+      );
+      
+      logger.info(`Restarted instance ${instanceId}`);
+      
+      // Send a recovery prompt with context
+      const recoveryPrompt = `
+You were restarted due to being stuck. Your previous session became unresponsive.
+
+${savedTask ? `Your previous task was:\n${savedTask}\n\n` : ''}Review your current state:
+- Check \`git status\` to see what you were working on
+- Review recent commits with \`git log --oneline -5\`
+- Continue from where you left off or escalate if blocked
+
+Please resume your work.
+      `.trim();
+      
+      await this.instanceManager.sendPrompt(instanceId, recoveryPrompt);
+    } catch (err) {
+      logger.error(`Failed to restart stuck instance ${instanceId}`, err);
+    }
+  }
+
+  /**
+   * Parse worker ID from instance ID (e.g., "worker-5" -> 5)
+   */
+  private parseWorkerId(instanceId: string): number | null {
+    const match = instanceId.match(/^worker-(\d+)$/);
+    return match ? parseInt(match[1], 10) : null;
   }
 
   private async initializeDirector(): Promise<void> {
@@ -1482,6 +1693,78 @@ Start now: Sync and read your task list.
   }
 
   /**
+   * Start queue health monitoring
+   */
+  private startQueueHealthMonitor(intervalMs: number): void {
+    if (this.queueHealthInterval) {
+      clearInterval(this.queueHealthInterval);
+    }
+
+    this.queueHealthInterval = setInterval(() => {
+      this.checkQueueHealth().catch(err => {
+        logger.error('Queue health check failed', err);
+      });
+    }, intervalMs);
+
+    logger.info(`Queue health monitor started (interval: ${intervalMs / 60000} minutes)`);
+  }
+
+  /**
+   * Check health of all merge queues and log warnings for stuck items
+   */
+  private async checkQueueHealth(): Promise<void> {
+    const STUCK_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+    const warnings: string[] = [];
+
+    // Check director queue
+    if (this.directorMergeQueue) {
+      const items = this.directorMergeQueue.getQueueItems();
+      for (const item of items) {
+        if (item.ageMs > STUCK_THRESHOLD_MS) {
+          warnings.push(
+            `Director queue: Team-${item.id} stuck for ${(item.ageMs / 60000).toFixed(1)} minutes ` +
+            `(${item.attemptCount} attempts)`
+          );
+        }
+      }
+    }
+
+    // Check manager queue (non-hierarchy mode)
+    if (this.managerMergeQueue) {
+      const items = this.managerMergeQueue.getQueueItems();
+      for (const item of items) {
+        if (item.ageMs > STUCK_THRESHOLD_MS) {
+          warnings.push(
+            `Manager queue: Worker-${item.id} stuck for ${(item.ageMs / 60000).toFixed(1)} minutes ` +
+            `(${item.attemptCount} attempts)`
+          );
+        }
+      }
+    }
+
+    // Check team queues
+    for (const team of this.teams) {
+      const items = team.mergeQueue.getQueueItems();
+      for (const item of items) {
+        if (item.ageMs > STUCK_THRESHOLD_MS) {
+          warnings.push(
+            `Team-${team.id} queue: Worker-${item.id} stuck for ${(item.ageMs / 60000).toFixed(1)} minutes ` +
+            `(${item.attemptCount} attempts)`
+          );
+        }
+      }
+    }
+
+    // Log all warnings
+    if (warnings.length > 0) {
+      logger.warn('Queue health issues detected:');
+      for (const warning of warnings) {
+        logger.warn(`  - ${warning}`);
+      }
+    }
+  }
+
+  /**
    * Manager heartbeat - used when hierarchy is disabled.
    */
   private startManagerHeartbeat(intervalMs: number): void {
@@ -1591,6 +1874,13 @@ If action needed: Take the action, then STOP.
     if (!atPrompt) {
       logger.debug('Director not at prompt, skipping heartbeat');
       return;
+    }
+
+    // Process any pending merges in the queue first
+    if (this.directorMergeQueue && this.directorMergeQueue.size() > 0 && !this.directorMergeQueue.isCurrentlyProcessing()) {
+      logger.info(`Director heartbeat: Processing pending merge queue (${this.directorMergeQueue.size()} items)`);
+      this.processDirectorMergeQueue();
+      return; // Skip regular heartbeat this cycle to let merge complete
     }
 
     logger.info('Sending director heartbeat');
@@ -1784,6 +2074,32 @@ You only coordinate Engineering Managers. NEVER touch worker task lists directly
       logger.info(`Restoring task for ${instance.id}`);
       await this.instanceManager.sendPrompt(instance.id, savedTask);
     }
+
+    // Resume merge queue processing if this was an EM or Manager
+    if (instance.type === 'em') {
+      const team = this.teams.find(t => t.emInstanceId === instance.id);
+      if (team && team.mergeQueue.size() > 0) {
+        logger.info(`Resuming merge queue for ${instance.id} (${team.mergeQueue.size()} items pending)`);
+        // Trigger queue processing after the instance is ready
+        setTimeout(() => {
+          team.mergeQueue.processNext().catch(err => {
+            logger.error(`Failed to resume EM merge queue after recreation`, err);
+          });
+        }, 10000); // Give instance time to fully initialize
+      }
+    } else if (instance.type === 'manager' && this.managerMergeQueue && this.managerMergeQueue.size() > 0) {
+      logger.info(`Resuming manager merge queue (${this.managerMergeQueue.size()} items pending)`);
+      setTimeout(() => {
+        this.managerMergeQueue!.processNext().catch(err => {
+          logger.error(`Failed to resume manager merge queue after recreation`, err);
+        });
+      }, 10000);
+    } else if (instance.type === 'director' && this.directorMergeQueue && this.directorMergeQueue.size() > 0) {
+      logger.info(`Resuming director merge queue (${this.directorMergeQueue.size()} items pending)`);
+      setTimeout(() => {
+        this.processDirectorMergeQueue();
+      }, 10000);
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -1796,6 +2112,10 @@ You only coordinate Engineering Managers. NEVER touch worker task lists directly
     if (this.reconcileInterval) {
       clearInterval(this.reconcileInterval);
       this.reconcileInterval = null;
+    }
+    if (this.queueHealthInterval) {
+      clearInterval(this.queueHealthInterval);
+      this.queueHealthInterval = null;
     }
     if (this.managerHeartbeatInterval) {
       clearInterval(this.managerHeartbeatInterval);
@@ -1908,29 +2228,6 @@ You only coordinate Engineering Managers. NEVER touch worker task lists directly
         sessions: instanceList.map((instance) => ({ id: instance.id, path: instance.logFile })),
       },
     };
-  }
-
-  private resolveUiBuildDir(): string | null {
-    const envValue = process.env.ORCHESTRATOR_UI_DIR ?? process.env.ORCHESTRATOR_UI_DIST;
-    const candidates = [envValue, join(process.cwd(), 'web', 'out', 'ui'), join(process.cwd(), 'web', 'out')];
-
-    for (const candidate of candidates) {
-      if (!candidate) {
-        continue;
-      }
-
-      const trimmed = candidate.trim();
-      if (!trimmed) {
-        continue;
-      }
-
-      const indexPath = join(trimmed, 'index.html');
-      if (existsSync(indexPath)) {
-        return trimmed;
-      }
-    }
-
-    return null;
   }
 }
 

@@ -1,8 +1,5 @@
 # Dependencies
 node_modules/
-web/node_modules/
-web/.next/
-web/out/
 
 # Build output
 dist/
@@ -31,3 +28,5 @@ Thumbs.db
 .env.local
 
 *.txt
+
+coverage/

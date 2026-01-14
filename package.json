@@ -6,14 +6,9 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "build:all": "npm run build && npm run build:web",
-    "prestart": "npm run build:all",
-    "postinstall": "cd web && npm install && cd ..",
+    "prestart": "npm run build",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "dev:web": "npm --prefix web run dev",
-    "build:web": "npm --prefix web run build",
-    "lint:web": "npm --prefix web run lint",
     "test": "vitest",
     "test:run": "vitest run",
     "test:e2e": "tsx tests/e2e/run-e2e.ts",
@@ -40,6 +35,7 @@
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^4.0.17",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.17"

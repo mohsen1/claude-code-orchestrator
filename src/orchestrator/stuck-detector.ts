@@ -5,10 +5,20 @@ import { logger } from '../utils/logger.js';
 const DEFAULT_STUCK_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes without tool use
 const NUDGE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes - try nudging first
 
+/**
+ * Tracks recovery attempts for an instance
+ */
+interface RecoveryState {
+  nudgeCount: number;
+  ctrlCCount: number;
+  lastAttemptTime: number;
+}
+
 export class StuckDetector {
   private checkInterval: NodeJS.Timeout | null = null;
   private stuckThresholdMs: number;
   private nudgedInstances: Set<string> = new Set(); // Track which instances we've nudged
+  private recoveryStates: Map<string, RecoveryState> = new Map(); // Track recovery attempts
 
   constructor(
     private instanceManager: ClaudeInstanceManager,
@@ -63,7 +73,12 @@ export class StuckDetector {
 
     for (const instance of instances) {
       // Only check busy instances
-      if (instance.status !== 'busy') continue;
+      if (instance.status !== 'busy') {
+        // Clear recovery state when not busy
+        this.recoveryStates.delete(instance.id);
+        this.nudgedInstances.delete(instance.id);
+        continue;
+      }
 
       // Initialize lastToolUse if not set (grace period)
       if (!instance.lastToolUse) {
@@ -73,38 +88,67 @@ export class StuckDetector {
 
       const idleTime = now - instance.lastToolUse.getTime();
 
+      // Get or create recovery state
+      let recoveryState = this.recoveryStates.get(instance.id);
+      if (!recoveryState) {
+        recoveryState = { nudgeCount: 0, ctrlCCount: 0, lastAttemptTime: 0 };
+        this.recoveryStates.set(instance.id, recoveryState);
+      }
+
       // STAGE 1: Nudge (2 minutes) - try to auto-answer prompts
       if (idleTime > NUDGE_THRESHOLD_MS && idleTime < this.stuckThresholdMs) {
         if (!this.nudgedInstances.has(instance.id) && this.tmux) {
           await this.tryNudge(instance.id, instance.sessionName);
           this.nudgedInstances.add(instance.id);
+          recoveryState.nudgeCount++;
+          recoveryState.lastAttemptTime = now;
         }
         continue;
       }
 
-      // STAGE 2: Hard intervention (threshold reached)
+      // STAGE 2+: Hard interventions (threshold reached)
       if (idleTime > this.stuckThresholdMs) {
-        logger.warn(
-          `Instance ${instance.id} stuck (no activity for ${(idleTime / 60000).toFixed(1)} minutes). Intervening...`
+        // Wait at least 1 minute between escalation attempts
+        if (now - recoveryState.lastAttemptTime < 60000) {
+          continue;
+        }
+
+        // Stage 2: Send Ctrl+C (try up to 2 times)
+        if (recoveryState.ctrlCCount < 2) {
+          logger.warn(
+            `Instance ${instance.id} stuck (no activity for ${(idleTime / 60000).toFixed(1)} minutes). ` +
+            `Sending Ctrl+C (attempt ${recoveryState.ctrlCCount + 1}/2)`
+          );
+
+          try {
+            if (this.tmux) {
+              await this.tmux.sendControlKey(instance.sessionName, 'C-c');
+              await new Promise(r => setTimeout(r, 2000));
+              await this.tmux.sendKeys(instance.sessionName, '', true); // Send Enter to clear
+            }
+
+            recoveryState.ctrlCCount++;
+            recoveryState.lastAttemptTime = now;
+            instance.lastToolUse = new Date(); // Reset timer to give it time to respond
+          } catch (err) {
+            logger.error(`Failed to send Ctrl+C to instance ${instance.id}`, err);
+          }
+          continue;
+        }
+
+        // Stage 3: Escalate to orchestrator for restart/EM notification
+        logger.error(
+          `Instance ${instance.id} permanently stuck after ${recoveryState.nudgeCount} nudges and ` +
+          `${recoveryState.ctrlCCount} Ctrl+C attempts. Escalating to orchestrator.`
         );
 
         try {
-          // Try Ctrl+C first to break any loops
-          if (this.tmux) {
-            await this.tmux.sendControlKey(instance.sessionName, 'C-c');
-            await new Promise(r => setTimeout(r, 2000));
-            // Send Enter to clear prompt
-            await this.tmux.sendKeys(instance.sessionName, '', true);
-          }
-
-          // Reset timer so we don't spam interventions
-          instance.lastToolUse = new Date();
           this.nudgedInstances.delete(instance.id);
-
-          // Notify orchestrator handler
+          this.recoveryStates.delete(instance.id);
+          instance.lastToolUse = new Date(); // Reset to prevent immediate re-escalation
           await this.onStuck(instance.id);
         } catch (err) {
-          logger.error(`Failed to handle stuck instance ${instance.id}`, err);
+          logger.error(`Failed to escalate stuck instance ${instance.id}`, err);
         }
       }
     }

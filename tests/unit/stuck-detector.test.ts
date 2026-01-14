@@ -130,13 +130,42 @@ describe('StuckDetector', () => {
   });
 
   describe('internal check method', () => {
-    it('should call onStuck callback for stuck instances', async () => {
+    it('should attempt Ctrl+C recovery before escalating to onStuck', async () => {
+      const mockTmux = {
+        sendControlKey: vi.fn().mockResolvedValue(undefined),
+        sendKeys: vi.fn().mockResolvedValue(undefined),
+      };
+      
+      const detectorWithTmux = new StuckDetector(
+        mockInstanceManager as any,
+        onStuckCallback,
+        60000, // 1 minute threshold
+        mockTmux as any
+      );
+
+      // Stage 1: First Ctrl+C attempt
       const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
       mockInstanceManager.setLastToolUse('worker-1', twoMinutesAgo);
+      await (detectorWithTmux as any).check();
+      
+      expect(mockTmux.sendControlKey).toHaveBeenCalledTimes(1);
+      expect(onStuckCallback).not.toHaveBeenCalled();
 
-      // Directly call the private check method
-      await (stuckDetector as any).check();
+      // Stage 2: Second Ctrl+C attempt (after 1 minute cooldown)
+      // Update recovery state to simulate time passing
+      const recoveryState = (detectorWithTmux as any).recoveryStates.get('worker-1');
+      recoveryState.lastAttemptTime = Date.now() - 61000; // 1 minute ago
+      mockInstanceManager.setLastToolUse('worker-1', new Date(Date.now() - 3 * 60 * 1000));
+      
+      await (detectorWithTmux as any).check();
+      expect(mockTmux.sendControlKey).toHaveBeenCalledTimes(2);
+      expect(onStuckCallback).not.toHaveBeenCalled();
 
+      // Stage 3: Escalate after 2 failed Ctrl+C attempts
+      recoveryState.lastAttemptTime = Date.now() - 61000;
+      mockInstanceManager.setLastToolUse('worker-1', new Date(Date.now() - 4 * 60 * 1000));
+      
+      await (detectorWithTmux as any).check();
       expect(onStuckCallback).toHaveBeenCalledWith('worker-1');
     });
 
@@ -168,18 +197,30 @@ describe('StuckDetector', () => {
 
     it('should continue checking after callback error', async () => {
       const errorCallback = vi.fn().mockRejectedValue(new Error('Test error'));
+      const mockTmux = {
+        sendControlKey: vi.fn().mockResolvedValue(undefined),
+        sendKeys: vi.fn().mockResolvedValue(undefined),
+      };
+      
       const detector = new StuckDetector(
         mockInstanceManager as any,
         errorCallback,
-        60000
+        60000,
+        mockTmux as any
       );
 
-      const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
-      mockInstanceManager.setLastToolUse('worker-1', twoMinutesAgo);
+      // Set up state to trigger immediate escalation (simulate already tried Ctrl+C twice)
+      const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+      mockInstanceManager.setLastToolUse('worker-1', tenMinutesAgo);
+      
+      (detector as any).recoveryStates.set('worker-1', {
+        nudgeCount: 1,
+        ctrlCCount: 2,
+        lastAttemptTime: Date.now() - 120000
+      });
 
-      // Should not throw
+      // Should not throw even though callback errors
       await expect((detector as any).check()).resolves.not.toThrow();
-
       expect(errorCallback).toHaveBeenCalled();
     });
   });

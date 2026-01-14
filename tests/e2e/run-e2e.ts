@@ -256,12 +256,16 @@ async function createTestConfig(branchName: string): Promise<string> {
   const configDir = `/tmp/e2e-config-${Date.now()}`;
   await mkdir(configDir, { recursive: true });
 
+  const engineerManagerGroupSize = Math.min(8, Math.max(1, WORKER_COUNT - 1));
+  const hookServerPort = 20000 + Math.floor(Math.random() * 30000);
+
   const config = {
     repositoryUrl: `git@github.com:${TEST_REPO}.git`,
     branch: branchName,
     model: MODEL,
     workerCount: WORKER_COUNT,
-    hookServerPort: 3456,
+    engineerManagerGroupSize,
+    hookServerPort,
     stuckThresholdMs: 180000, // 3 minutes
     managerHeartbeatIntervalMs: 120000, // 2 minutes
     maxRunDurationMinutes: DURATION_MINUTES + 2,
@@ -280,7 +284,7 @@ async function createTestConfig(branchName: string): Promise<string> {
   return configDir;
 }
 
-async function runOrchestrator(configDir: string, durationMs: number): Promise<{ stdout: string; stderr: string }> {
+async function runOrchestrator(configDir: string, workspaceDir: string, durationMs: number): Promise<{ stdout: string; stderr: string }> {
   log(`Starting orchestrator for ${durationMs / 60000} minutes...`);
 
   const orchestratorPath = join(process.cwd(), 'dist', 'index.js');
@@ -289,7 +293,7 @@ async function runOrchestrator(configDir: string, durationMs: number): Promise<{
     let stdout = '';
     let stderr = '';
 
-    const proc = execa('node', [orchestratorPath, '--config', configDir], {
+    const proc = execa('node', [orchestratorPath, '--config', configDir, '--workspace', workspaceDir], {
       reject: false,
       timeout: durationMs + 30000, // Add 30s buffer
     });
@@ -379,7 +383,7 @@ async function validateResults(branchName: string): Promise<TestResult> {
   }
 }
 
-async function cleanup(configDir: string): Promise<void> {
+async function cleanup(configDir: string, workspaceDir: string): Promise<void> {
   if (values.cleanup) {
     log('Cleaning up...');
     await rm(configDir, { recursive: true, force: true });
@@ -387,8 +391,9 @@ async function cleanup(configDir: string): Promise<void> {
     // Kill any orphaned tmux sessions
     await runCommand('bash', ['-c', "tmux list-sessions 2>/dev/null | grep '^claude-' | cut -d: -f1 | xargs -I{} tmux kill-session -t {} 2>/dev/null || true"]);
 
-    // Clean workspace
-    await rm('/tmp/orchestrator-workspace', { recursive: true, force: true }).catch(() => {});
+    if (workspaceDir) {
+      await rm(workspaceDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
@@ -403,6 +408,7 @@ async function main() {
   console.log('='.repeat(60));
 
   let configDir = '';
+  let workspaceDir = '';
   let branchName = '';
 
   try {
@@ -411,6 +417,9 @@ async function main() {
 
     // 2. Create test config
     configDir = await createTestConfig(branchName);
+    workspaceDir = `/tmp/orchestrator-e2e-${Date.now()}`;
+    await rm(workspaceDir, { recursive: true, force: true }).catch(() => {});
+    await mkdir(workspaceDir, { recursive: true });
 
     // 3. Build the project first
     log('Building orchestrator...');
@@ -418,7 +427,7 @@ async function main() {
 
     // 4. Run orchestrator
     const durationMs = DURATION_MINUTES * 60 * 1000;
-    await runOrchestrator(configDir, durationMs);
+    await runOrchestrator(configDir, workspaceDir, durationMs);
 
     // 5. Validate results
     const result = await validateResults(branchName);
@@ -446,7 +455,7 @@ async function main() {
     console.error('E2E test failed with error:', err);
     process.exit(1);
   } finally {
-    await cleanup(configDir);
+    await cleanup(configDir, workspaceDir);
   }
 }
 

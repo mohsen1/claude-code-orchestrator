@@ -4,11 +4,11 @@ A distributed system for orchestrating multiple Claude Code instances to work co
 
 ## Overview
 
-The orchestrator spawns multiple Claude Code instances that work in parallel on a shared codebase. A Manager instance delegates tasks to Worker instances, each operating in isolated git worktrees. Workers complete tasks, push to their branches, and the Manager merges changes back to main.
+The orchestrator spawns multiple Claude Code instances that work in parallel on a shared codebase. A Director coordinates Engineering Managers (EMs), and each EM commands a team of Workers operating in isolated git worktrees. Workers complete tasks, push to their branches, EMs curate their team branches, and the Director merges strategic changes back to the main branch.
 
 ## Features
 
-- Manager/Worker architecture with event-driven coordination
+- Director/Engineering Manager/Worker hierarchy with event-driven coordination
 - Git worktree isolation for parallel development
 - Automatic rate limit detection and config rotation
 - OAuth and API key authentication support
@@ -48,19 +48,34 @@ Create a config directory with the following files:
 |--------|------|---------|-------------|
 | `repositoryUrl` | string | *required* | URL of the git repository to work on |
 | `branch` | string | `"main"` | Branch to check out and work from |
+| `logDirectory` | string | `config directory` | Where per-run logs are stored. Paths are resolved relative to the config directory. Each orchestrator launch creates a timestamped folder that captures orchestrator logs plus tmux session output. |
 | `cloneDepth` | number | *none* | Shallow clone depth (e.g., `1` for latest commit only) |
 | `model` | string | *none* | Claude model to use (`haiku`, `sonnet`, `opus`) |
 | `authMode` | string | `"oauth"` | Auth startup mode: `oauth`, `api-keys-first`, or `api-keys-only` |
 | `envFiles` | string[] | *none* | Paths to env files to copy to each worktree (see [Environment Files](#environment-files)) |
 | `workerCount` | number | *required* | Number of worker instances (1-20) |
+| `engineerManagerGroupSize` | number | `4` | Maximum workers per Engineering Manager team (1-8). If `workerCount` exceeds this value the Director/EM hierarchy is enabled; otherwise the legacy manager→worker flow runs. |
 | `hookServerPort` | number | `3000` | Port for the internal hook server (1024-65535) |
 | `healthCheckIntervalMs` | number | `30000` | Health check polling interval in milliseconds (min: 5000) |
 | `rateLimitCheckIntervalMs` | number | `10000` | Rate limit detection interval in milliseconds (min: 5000) |
 | `stuckThresholdMs` | number | `300000` | Time without tool use before instance is considered stuck (min: 60000) |
-| `managerHeartbeatIntervalMs` | number | `600000` | Manager heartbeat interval in milliseconds (min: 60000, default: 10 min) |
+| `managerHeartbeatIntervalMs` | number | `600000` | Director heartbeat interval in milliseconds (min: 60000, default: 10 min) |
 | `maxToolUsesPerInstance` | number | `500` | Maximum tool invocations per instance before stopping (min: 100) |
 | `maxTotalToolUses` | number | `2000` | Maximum total tool invocations across all instances (min: 500) |
 | `maxRunDurationMinutes` | number | `120` | Maximum orchestrator run time in minutes (min: 10) |
+
+### Run Logs
+
+Set `logDirectory` to control where the orchestrator writes logs. If omitted, the config directory is used. Every launch creates a timestamped folder (for example, `run-2026-01-14T06-59-00Z/`) that captures:
+
+- `combined.log` / `error.log` from the orchestrator and hook server
+- One file per tmux session (e.g., `session-director.log`, `session-worker-1.log`)
+
+These files grow for the lifetime of the run so you can audit every command Claude executed.
+
+### Director/Engineering Manager hierarchy
+
+Set `engineerManagerGroupSize` to control how many workers each EM may supervise. When `workerCount` is greater than this cap, the Director automatically creates enough EM teams to cover `workerCount`, resizes rosters after every escalation, and can kill or respawn teams when they underperform. When `workerCount` is less than or equal to the cap, the orchestrator remains in the simpler Manager/Worker mode. Each EM-enabled team owns an EM-specific branch (e.g., `team-1-main`) plus worker branches (`worker-1`, `worker-2`, ...). Keep `TEAM_STRUCTURE.md`, `EM_<id>_TASKS.md`, and `WORKER_<id>_TASK_LIST.md` in your repo so Claude can coordinate work between layers.
 
 ### auth-configs.json (optional, for rate limit rotation)
 
@@ -113,17 +128,17 @@ Orchestrator (Node.js)
     |
     +-- Hook Server (Express) <-- receives events from Claude instances
     |
-    +-- Manager Instance (tmux + claude)
-    |       |
-    |       +-- Reads PROJECT_DIRECTION.md
-    |       +-- Creates WORKER_N_TASK_LIST.md files
-    |       +-- Merges worker branches
+    +-- Director Instance (tmux + claude)
+    |       +-- Sets strategy, merges EM branches, resizes teams
     |
-    +-- Worker 1 (tmux + claude, worktree: worker-1)
-    |       +-- Reads task list, executes, commits, pushes
+    +-- Engineering Manager 1 (worktree: team-1)
+    |       +-- Manages workers 1-4, maintains EM_1_TASKS.md, merges worker branches
     |
-    +-- Worker 2 (tmux + claude, worktree: worker-2)
-            +-- Reads task list, executes, commits, pushes
+    +-- Engineering Manager 2 (worktree: team-2)
+        +-- Manages workers 5-8 (etc.)
+
+  Workers (tmux + claude, worktrees worker-N)
+    +-- Read WORKER_N_TASK_LIST.md, execute tasks, commit, push
 ```
 
 ## Rate Limit Rotation

@@ -1,7 +1,7 @@
 import { TmuxManager } from '../tmux/session.js';
 import { logger } from '../utils/logger.js';
 
-export type InstanceType = 'manager' | 'worker';
+export type InstanceType = 'director' | 'em' | 'worker' | 'manager';
 export type InstanceStatus =
   | 'starting'
   | 'ready'

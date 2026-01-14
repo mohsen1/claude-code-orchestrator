@@ -23,7 +23,7 @@ import { execa } from 'execa';
 import { mkdir, rm, copyFile, writeFile, readFile, appendFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
-import { logger } from '../utils/logger.js';
+import { logger, configureLogDirectory } from '../utils/logger.js';
 
 const ENV_FILES = ['.env', '.env.local'];
 
@@ -80,6 +80,18 @@ class MergeQueue {
   }
 }
 
+interface EngineeringTeam {
+  id: number;
+  workerIds: number[];
+  branchName: string;
+  worktreePath: string;
+  emInstanceId: string;
+  status: 'active' | 'decommissioned';
+  mergeQueue: MergeQueue;
+  lastAssessment: number;
+  priorityScore: number;
+}
+
 /**
  * Auth configuration for a Claude instance.
  * Can be OAuth (empty), API key, or z.ai style.
@@ -97,9 +109,12 @@ export class Orchestrator {
   private costTracker: CostTracker;
   private stuckDetector: StuckDetector;
   private git!: GitManager;
-  private mergeQueue: MergeQueue;
+  private useHierarchy: boolean;
+  private directorMergeQueue: MergeQueue | null = null;
+  private managerMergeQueue: MergeQueue | null = null;
   private reconcileInterval: NodeJS.Timeout | null = null;
   private managerHeartbeatInterval: NodeJS.Timeout | null = null;
+  private directorHeartbeatInterval: NodeJS.Timeout | null = null;
   private isShuttingDown = false;
   private workspaceDir: string;
 
@@ -112,17 +127,27 @@ export class Orchestrator {
   private workerLastPromptTime: Map<number, number> = new Map();
   private static readonly WORKER_PROMPT_COOLDOWN_MS = 300000; // 5 minutes between re-prompts
   private static readonly WORKER_IDLE_THRESHOLD_MS = 300000; // 5 minutes idle before re-prompting
+  private teams: EngineeringTeam[] = [];
+  private workerToTeam: Map<number, number> = new Map();
+  private nextTeamId = 1;
+  private logBaseDir: string;
+  private runLogDir: string | null;
+  private logsInitialized = false;
 
   constructor(
     private config: OrchestratorConfig,
     workspaceDir: string = '/tmp/orchestrator-workspace',
-    authConfigs: AuthConfig[] = []
+    authConfigs: AuthConfig[] = [],
+    runLogDir?: string
   ) {
     this.workspaceDir = workspaceDir;
     this.authConfigs = authConfigs;
+    this.runLogDir = runLogDir ?? null;
     this.validateAuthMode();
     this.authRotationPool = this.buildAuthRotationPool();
     this.authRotationIndex = 0;
+    this.useHierarchy = this.config.workerCount > this.config.engineerManagerGroupSize;
+    this.logBaseDir = this.config.logDirectory ?? workspaceDir;
 
     // Initialize components
     this.hookServer = new HookServer(config.hookServerPort);
@@ -148,10 +173,17 @@ export class Orchestrator {
       this.tmux
     );
 
-    this.mergeQueue = new MergeQueue((workerId) => this.notifyManagerOfCompletion(workerId));
+    if (this.useHierarchy) {
+      this.initializeTeams();
+      this.directorMergeQueue = new MergeQueue((teamId) => this.notifyDirectorOfCompletion(teamId));
+    } else {
+      this.directorMergeQueue = null;
+      this.managerMergeQueue = new MergeQueue((workerId) => this.notifyManagerOfCompletion(workerId));
+    }
   }
 
   async start(): Promise<void> {
+    await this.initializeRunLogging();
     logger.info('Starting host-native orchestrator...');
 
     try {
@@ -182,11 +214,17 @@ export class Orchestrator {
       this.rateLimitDetector.start(10000);
       this.stuckDetector.start(60000);
       this.startReconcileLoop(30000);
-      this.startManagerHeartbeat(this.config.managerHeartbeatIntervalMs);
+      if (this.useHierarchy) {
+        this.startDirectorHeartbeat(this.config.managerHeartbeatIntervalMs);
+      } else {
+        this.startManagerHeartbeat(this.config.managerHeartbeatIntervalMs);
+      }
 
       // 6. Initialize or resume instances
       if (canResume) {
         await this.resumeInstances();
+      } else if (this.useHierarchy) {
+        await this.initializeDirector();
       } else {
         await this.initializeManager();
       }
@@ -199,12 +237,31 @@ export class Orchestrator {
         authMode: this.config.authMode,
         startupAuth: this.getStartupAuthConfig()?.name ?? 'OAuth',
         authConfigsAvailable: this.authConfigs.length,
+        hierarchyEnabled: this.useHierarchy,
+        runLogDir: this.runLogDir,
       });
     } catch (err) {
       logger.error('Failed to start orchestrator', err);
       await this.shutdown();
       throw err;
     }
+  }
+
+  private async initializeRunLogging(): Promise<void> {
+    if (this.logsInitialized) {
+      return;
+    }
+
+    if (!this.runLogDir) {
+      await mkdir(this.logBaseDir, { recursive: true });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      this.runLogDir = join(this.logBaseDir, `run-${timestamp}`);
+    }
+
+    await mkdir(this.runLogDir, { recursive: true });
+    configureLogDirectory(this.runLogDir);
+    this.logsInitialized = true;
+    logger.info('Log directory initialized', { runLogDir: this.runLogDir });
   }
 
   /**
@@ -297,6 +354,8 @@ export class Orchestrator {
       }
     }
 
+    await this.setupEngineeringManagerWorktrees();
+
     logger.info('Workspace sync complete');
   }
 
@@ -309,31 +368,38 @@ export class Orchestrator {
     // Wait for Claude to initialize in sessions
     await new Promise(r => setTimeout(r, 3000));
 
-    // Resume manager
-    const managerPrompt = `
+    if (this.useHierarchy) {
+      const directorPrompt = `
 ## ORCHESTRATOR RESUMED
 
-The orchestrator has been restarted. Resume your work.
+You are the Director. Review TEAM_STRUCTURE.md, EM_* task files, and resume coordinating EMs only. Reassess team sizes after each escalation.
+      `.trim();
 
-**Your role:** Manager - coordinate workers and merge their work.
+      await this.instanceManager.sendPrompt('director', directorPrompt);
 
-**Immediate actions:**
-1. Check current branch: \`git status --short\`
-2. Pull latest: \`git fetch origin && git reset --hard origin/${this.config.branch}\`
-3. Check for pending worker merges: \`git branch -r | grep worker\`
-4. Check which workers need tasks: Look at WORKER_*_TASK_LIST.md files
-5. Take appropriate action (merge pending work or assign new tasks)
-6. STOP when done
+      for (const team of this.teams) {
+        if (team.status !== 'active') continue;
+        const prompt = `
+## TEAM RESUMED
 
-Continue working autonomously. NEVER ask questions.
-    `.trim();
+You are EM-${team.id}. Re-sync ${team.branchName}, review EM_${team.id}_TASKS.md, and continue merging worker branches (${team.workerIds.map(id => `worker-${id}`).join(', ')}).
+        `.trim();
+        await this.instanceManager.sendPrompt(team.emInstanceId, prompt);
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    } else {
+      const prompt = `
+## ORCHESTRATOR RESUMED
 
-    await this.instanceManager.sendPrompt('manager', managerPrompt);
+You are the Manager. Re-sync ${this.config.branch}, inspect worker task lists, and continue merging worker branches directly. Reassign tasks as needed.
+      `.trim();
+      await this.instanceManager.sendPrompt('manager', prompt);
+    }
 
     // Resume workers with staggered prompts
     for (let i = 1; i <= this.config.workerCount; i++) {
       await this.resumeWorker(i);
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 1000));
     }
 
     logger.info('All instances resumed');
@@ -344,17 +410,20 @@ Continue working autonomously. NEVER ask questions.
    */
   private async resumeWorker(workerId: number): Promise<void> {
     const worktreePath = `${this.workspaceDir}/worktrees/worker-${workerId}`;
+    const team = this.getTeamForWorker(workerId);
+    const fallbackLabel = this.useHierarchy ? 'director' : 'manager';
+    const teamLabel = team ? `EM-${team.id}` : fallbackLabel;
 
     const prompt = `
 ## ORCHESTRATOR RESUMED
 
 The orchestrator has been restarted. Resume your work.
 
-**Your role:** Worker ${workerId}
+**Your role:** Worker ${workerId} reporting to ${teamLabel}
 
 **Immediate actions:**
 1. Sync with latest: \`git fetch origin && git reset --hard origin/${this.config.branch}\`
-2. Read your task list: \`cat WORKER_${workerId}_TASK_LIST.md\`
+2. Read your task list: \`cat WORKER_${workerId}_TASK_LIST.md\` (maintained by ${teamLabel})
 3. Work on your Current Task
 4. When done: commit, push to worker-${workerId}, and STOP
 
@@ -407,6 +476,8 @@ Continue working autonomously. NEVER ask questions.
     await Promise.all(
       Array.from({ length: this.config.workerCount }, (_, i) => createWorktree(i + 1))
     );
+
+    await this.setupEngineeringManagerWorktrees();
   }
 
   private async copyEnvFiles(sourceDir: string, destDir: string): Promise<void> {
@@ -472,6 +543,72 @@ Continue working autonomously. NEVER ask questions.
     }
   }
 
+  private initializeTeams(): void {
+    const workerIds = Array.from({ length: this.config.workerCount }, (_, idx) => idx + 1);
+    const maxTeamSize = this.config.engineerManagerGroupSize;
+    const teamCount = Math.max(1, Math.ceil(workerIds.length / maxTeamSize));
+
+    this.teams = [];
+    this.workerToTeam.clear();
+
+    for (let teamIndex = 0; teamIndex < teamCount; teamIndex++) {
+      const teamId = this.nextTeamId++;
+      const start = teamIndex * maxTeamSize;
+      const end = Math.min(start + maxTeamSize, workerIds.length);
+      const members = workerIds.slice(start, end);
+      const team = this.buildTeamMetadata(teamId, members);
+      this.teams.push(team);
+      members.forEach(workerId => this.workerToTeam.set(workerId, teamId));
+    }
+  }
+
+  private buildTeamMetadata(teamId: number, workerIds: number[]): EngineeringTeam {
+    const branchName = `em-team-${teamId}`;
+    const worktreePath = join(this.workspaceDir, 'worktrees', `em-${teamId}`);
+    return {
+      id: teamId,
+      workerIds,
+      branchName,
+      worktreePath,
+      emInstanceId: `em-${teamId}`,
+      status: 'active',
+      mergeQueue: new MergeQueue((workerId) => this.notifyEngineeringManagerOfCompletion(teamId, workerId)),
+      lastAssessment: Date.now(),
+      priorityScore: 0,
+    };
+  }
+
+  private getTeam(teamId: number): EngineeringTeam | undefined {
+    return this.teams.find(team => team.id === teamId && team.status === 'active');
+  }
+
+  private getTeamForWorker(workerId: number): EngineeringTeam | undefined {
+    const teamId = this.workerToTeam.get(workerId);
+    return typeof teamId === 'number' ? this.getTeam(teamId) : undefined;
+  }
+
+  private async setupEngineeringManagerWorktrees(): Promise<void> {
+    if (!this.useHierarchy) {
+      return;
+    }
+
+    for (const team of this.teams) {
+      if (team.status !== 'active') {
+        continue;
+      }
+
+      if (existsSync(team.worktreePath)) {
+        await execa('git', ['-C', team.worktreePath, 'fetch', 'origin'], { reject: false });
+        await execa('git', ['-C', team.worktreePath, 'reset', '--hard', `origin/${this.config.branch}`], { reject: false });
+        await this.copyEnvFiles(this.workspaceDir, team.worktreePath);
+      } else {
+        await execa('git', ['-C', this.workspaceDir, 'branch', team.branchName], { reject: false });
+        await execa('git', ['-C', this.workspaceDir, 'worktree', 'add', team.worktreePath, team.branchName]);
+        await this.copyEnvFiles(this.workspaceDir, team.worktreePath);
+      }
+    }
+  }
+
   private async ensureClaudeIgnored(workDir: string): Promise<void> {
     try {
       const { stdout } = await execa('git', ['-C', workDir, 'rev-parse', '--absolute-git-dir']);
@@ -507,16 +644,23 @@ Continue working autonomously. NEVER ask questions.
   private async createInstances(resumeMode: boolean = false): Promise<void> {
     const startupAuth = this.getStartupAuthConfig();
 
-    // Create or reconnect manager instance
-    await this.createInstance('manager', 'manager', 0, this.workspaceDir, startupAuth ?? undefined, resumeMode);
+    if (this.useHierarchy) {
+      await this.createInstance('director', 'director', 0, this.workspaceDir, startupAuth ?? undefined, resumeMode);
 
-    // Create or reconnect worker instances
+      for (const team of this.teams) {
+        await this.createInstance(team.emInstanceId, 'em', team.id, team.worktreePath, startupAuth ?? undefined, resumeMode);
+      }
+    } else {
+      await this.createInstance('manager', 'manager', 0, this.workspaceDir, startupAuth ?? undefined, resumeMode);
+    }
+
+    // Workers
     for (let i = 1; i <= this.config.workerCount; i++) {
       const worktreePath = `${this.workspaceDir}/worktrees/worker-${i}`;
       await this.createInstance(`worker-${i}`, 'worker', i, worktreePath, startupAuth ?? undefined, resumeMode);
     }
 
-    logger.info(`${resumeMode ? 'Reconnected to' : 'Created'} ${this.config.workerCount + 1} Claude instances`);
+    logger.info(`${resumeMode ? 'Reconnected to' : 'Created'} ${this.config.workerCount + this.teams.length + 1} Claude instances`);
   }
 
   /**
@@ -526,13 +670,14 @@ Continue working autonomously. NEVER ask questions.
    */
   private async createInstance(
     id: string,
-    type: 'manager' | 'worker',
+    type: 'director' | 'em' | 'worker' | 'manager',
     workerId: number,
     workDir: string,
     authConfig?: AuthConfig,
     resumeMode: boolean = false
   ): Promise<ClaudeInstance> {
     const sessionName = `claude-${id}`;
+    const sessionLogPath = this.getSessionLogPath(id);
 
     // Build environment variables
     const env: Record<string, string> = {
@@ -560,17 +705,20 @@ Continue working autonomously. NEVER ask questions.
     if (resumeMode) {
       const sessionExists = await this.tmux.sessionExists(sessionName);
       if (sessionExists) {
+        if (sessionLogPath) {
+          await this.tmux.attachSessionLogger(sessionName, sessionLogPath);
+        }
         logger.info(`Reconnecting to existing session: ${sessionName}`);
         // Ensure Claude is running in the session
         await this.tmux.ensureClaudeRunning(sessionName, workDir, this.config.model);
       } else {
         // Session doesn't exist, create it
         logger.info(`Session ${sessionName} not found, creating new one`);
-        await this.tmux.createSessionWithClaude(sessionName, workDir, env, this.config.model);
+        await this.tmux.createSessionWithClaude(sessionName, workDir, env, this.config.model, sessionLogPath ?? undefined);
       }
     } else {
       // Fresh mode: always create new session
-      await this.tmux.createSessionWithClaude(sessionName, workDir, env, this.config.model);
+      await this.tmux.createSessionWithClaude(sessionName, workDir, env, this.config.model, sessionLogPath ?? undefined);
     }
 
     const instance: ClaudeInstance = {
@@ -593,6 +741,13 @@ Continue working autonomously. NEVER ask questions.
     });
 
     return instance;
+  }
+
+  private getSessionLogPath(instanceId: string): string | null {
+    if (!this.runLogDir) {
+      return null;
+    }
+    return join(this.runLogDir, `session-${instanceId}.log`);
   }
 
   private registerHandlers(): void {
@@ -721,64 +876,98 @@ Please continue working.
     await this.instanceManager.sendPrompt(instanceId, nudgePrompt);
   }
 
-  private async initializeManager(): Promise<void> {
+  private async initializeDirector(): Promise<void> {
     // Wait for Claude to initialize
     await new Promise(r => setTimeout(r, 3000));
 
     const prompt = `
-You are the **Manager** instance of a Claude Code Orchestrator.
+You are the **Director** of the Claude Code Orchestrator.
 
 ## Your Environment
 - Working directory: ${this.workspaceDir}
-- **Target branch: ${this.config.branch}** (all merges go here)
-- Worker instances: ${this.config.workerCount} workers
+- Target branch: ${this.config.branch}
+- Engineering Managers: ${this.teams.length}
+- Workers: ${this.config.workerCount}
 
-## CRITICAL RULES
-1. **NEVER ask questions** - make decisions autonomously
-2. **NEVER output instructions for others** - take action yourself or send prompts to workers
-3. **Event-driven** - complete your task and STOP, you'll get new prompts when workers finish
-4. **Be decisive** - if something is unclear, make a reasonable choice and proceed
-5. **NEVER cd into worker directories** - ALWAYS stay in ${this.workspaceDir}
-6. **ALWAYS verify you're on ${this.config.branch}** - run \`git status --short\` before any git operation
+## Responsibilities
+1. Set direction based on PROJECT_DIRECTION.md.
+2. Define priorities for each Engineering Manager (EM) and review their escalations.
+3. Re-size teams dynamically after every merge. Team size must stay ≤ ${this.config.engineerManagerGroupSize}.
+4. Catch failing EMs or teams and kill/recreate them when needed.
+5. Merge only EM branches—never manage workers directly.
 
-## Your Task Now
+## Immediate Tasks
+1. Review PROJECT_DIRECTION.md and summarize focus for each team in TEAM_STRUCTURE.md.
+2. Create EM_<id>_TASKS.md files outlining goals per EM. Do **not** edit worker task lists directly.
+3. Commit/push your planning docs, then STOP and await EM escalations.
 
-1. **Read PROJECT_DIRECTION.md** to understand what to build
+Document every team decision so you can justify resizing or killing teams later.
+    `.trim();
 
-2. **Create task lists** for each worker:
-   - WORKER_1_TASK_LIST.md through WORKER_${this.config.workerCount}_TASK_LIST.md
+    await this.instanceManager.sendPrompt('director', prompt);
 
-   Format:
-   \`\`\`markdown
-   # Worker N Task List
+    // Initialize EMs and workers after Claude spins up
+    setTimeout(() => this.initializeEngineeringManagers(), 10000);
+    setTimeout(() => this.initializeWorkers(), 20000);
+  }
 
-   ## Current Task
-   - [ ] First task with clear description
+  private async initializeManager(): Promise<void> {
+    await new Promise(r => setTimeout(r, 3000));
 
-   ## Queue
-   - [ ] Second task
-   - [ ] Third task
+    const prompt = `
+You are the **Manager** of the Claude Code Orchestrator.
 
-   ## Completed
-   (none yet)
-   \`\`\`
+## Your Environment
+- Working directory: ${this.workspaceDir}
+- Target branch: ${this.config.branch}
+- Workers: ${this.config.workerCount}
 
-3. **Commit and push**:
-   \`\`\`bash
-   git add WORKER_*.md
-   git commit -m "Add worker task lists"
-   git push origin ${this.config.branch}
-   \`\`\`
+## Responsibilities
+1. Read PROJECT_DIRECTION.md and create/maintain each WORKER_<id>_TASK_LIST.md.
+2. Review worker output, merge branches directly into ${this.config.branch}, and push.
+3. Keep workers unblocked: assign new tasks, clarify priorities, and ensure they never wait on you.
+4. Stay decisive—resolve conflicts yourself and never defer work back to workers.
 
-4. **STOP** after pushing - workers will start automatically
+## Immediate Tasks
+1. Sync ${this.config.branch} and inspect PROJECT_DIRECTION.md.
+2. Draft/refresh all WORKER_<id>_TASK_LIST.md files with clear queues and "Current Task" sections.
+3. Commit/push your planning changes.
+4. Monitor worker branches and merge as soon as they push.
 
-Begin now: Read PROJECT_DIRECTION.md and create the task lists.
+Document every decision in PROJECT_DIRECTION.md or worker task lists so future restarts retain context.
     `.trim();
 
     await this.instanceManager.sendPrompt('manager', prompt);
+    setTimeout(() => this.initializeWorkers(), 5000);
+  }
 
-    // Initialize workers after a delay
-    setTimeout(() => this.initializeWorkers(), 15000);
+  private async initializeEngineeringManagers(): Promise<void> {
+    for (const team of this.teams) {
+      if (team.status !== 'active') continue;
+      await this.initializeEngineeringManager(team);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+
+  private async initializeEngineeringManager(team: EngineeringTeam): Promise<void> {
+    const prompt = `
+You are **Engineering Manager ${team.id} (EM-${team.id})**.
+
+## Team
+- Workers: ${team.workerIds.map(id => `worker-${id}`).join(', ')}
+- Branch: ${team.branchName}
+- Worktree: ${team.worktreePath}
+
+## Mission
+1. Keep ${team.branchName} in sync with ${this.config.branch}.
+2. Own task assignment. Maintain EM_${team.id}_TASKS.md and update each WORKER_<id>_TASK_LIST.md when giving tasks.
+3. Merge worker branches locally, run validations, and escalate to the Director only when stable.
+4. Be ready for roster changes; Director may resize or kill teams without notice.
+
+Start now: pull ${this.config.branch}, read PROJECT_DIRECTION.md, draft EM_${team.id}_TASKS.md, and assign focused work to your workers.
+    `.trim();
+
+    await this.instanceManager.sendPrompt(team.emInstanceId, prompt);
   }
 
   private async initializeWorkers(): Promise<void> {
@@ -788,77 +977,320 @@ Begin now: Read PROJECT_DIRECTION.md and create the task lists.
     }
   }
 
-  private async initializeWorker(workerId: number): Promise<void> {
-    const worktreePath = `${this.workspaceDir}/worktrees/worker-${workerId}`;
+    private async initializeWorker(workerId: number): Promise<void> {
+     const worktreePath = `${this.workspaceDir}/worktrees/worker-${workerId}`;
+    const team = this.getTeamForWorker(workerId);
+    const fallbackLabel = this.useHierarchy ? 'unassigned' : 'manager';
+    const teamLabel = team ? `EM-${team.id}` : fallbackLabel;
 
-    const prompt = `
-You are **Worker ${workerId}** in a Claude Code Orchestrator.
+     const prompt = `
+  You are **Worker ${workerId}** reporting to ${teamLabel}.
 
-## Your Environment
-- Working directory: ${worktreePath}
-- Your branch: worker-${workerId}
-- **Target branch: ${this.config.branch}** (always pull from here first!)
+  ## Environment
+  - Worktree: ${worktreePath}
+  - Branch: worker-${workerId}
+  - Target branch: ${this.config.branch}
 
-## CRITICAL RULES
-1. **NEVER ask questions** - make reasonable decisions and proceed
-2. **ALWAYS pull ${this.config.branch} first** - your worktree must be current before starting work
-3. **NEVER delete files** unless your task explicitly requires it
-4. **Keep commits focused** - one task = one commit
+  ## Rules
+  1. Follow directives from ${teamLabel} via WORKER_${workerId}_TASK_LIST.md.
+  2. Stay in your worktree; never touch other teams' directories.
+  3. Keep commits tight and descriptive.
+  4. STOP after pushing and wait for your EM.
 
-## Your Workflow
+  ## Workflow
+  1. Sync: git fetch origin && git reset --hard origin/${this.config.branch}
+  2. Read WORKER_${workerId}_TASK_LIST.md (maintained by ${teamLabel}).
+  3. Execute the current task fully.
+  4. git add -A && git commit -m "Complete: <task>" && git push origin worker-${workerId} --force.
 
-1. **FIRST - Sync with ${this.config.branch}**:
-   \`\`\`bash
-   git fetch origin
-   git reset --hard origin/${this.config.branch}
-   \`\`\`
+  When you stop, your EM will merge and the Director will handle escalations.
+     `.trim();
 
-2. **Read your task list**:
-   \`\`\`bash
-   cat WORKER_${workerId}_TASK_LIST.md
-   \`\`\`
+     await this.instanceManager.sendPrompt(`worker-${workerId}`, prompt);
+     logger.info(`Worker ${workerId} initialized`);
+    }
 
-3. **Work on "Current Task"** - implement it fully
-
-4. **Commit and push when done**:
-   \`\`\`bash
-   git add -A
-   git commit -m "Complete: <task description>"
-   git push origin worker-${workerId} --force
-   \`\`\`
-
-5. **STOP after pushing** - Manager will merge your work
-
-Start now: Sync with ${this.config.branch}, then read your task list.
-    `.trim();
-
-    await this.instanceManager.sendPrompt(`worker-${workerId}`, prompt);
-    logger.info(`Worker ${workerId} initialized`);
-  }
-
-  private handleTaskComplete(workerId: number, instanceType: 'manager' | 'worker'): void {
+  private handleTaskComplete(workerId: number, instanceType: 'director' | 'em' | 'worker' | 'manager'): void {
     if (this.isShuttingDown) return;
 
-    if (instanceType === 'worker') {
-      logger.info(`Worker ${workerId} completed task - queueing for merge`);
-      this.mergeQueue.enqueue(workerId);
-
-      // Only try to process if manager is truly idle and not in a processing cycle
-      const manager = this.instanceManager.getInstance('manager');
-      if (manager && manager.status === 'idle' && !this.mergeQueue.isCurrentlyProcessing()) {
-        // Delay slightly to allow batching of multiple worker completions
-        setTimeout(() => {
-          this.mergeQueue.processNext().catch(err => {
-            logger.error('Failed to process merge queue', err);
-          });
-        }, 5000);
+    if (!this.useHierarchy) {
+      if (instanceType === 'worker') {
+        logger.info(`Worker ${workerId} completed task - queueing merge for manager`);
+        this.managerMergeQueue?.enqueue(workerId);
+        this.processManagerMergeQueue();
+      } else if (instanceType === 'manager') {
+        logger.info('Manager completed merge - checking next worker');
+        this.processManagerMergeQueue();
       }
-    } else {
-      logger.info('Manager completed task');
-      // Manager finished - immediately try to process next item in queue
-      this.mergeQueue.processNext().catch(err => {
-        logger.error('Failed to process merge queue after manager completion', err);
+      return;
+    }
+
+    if (instanceType === 'worker') {
+      const team = this.getTeamForWorker(workerId);
+      if (!team) {
+        logger.warn(`Worker ${workerId} completed task but no team assignment found`);
+        return;
+      }
+
+      logger.info(`Worker ${workerId} completed task - queueing for EM-${team.id}`);
+      team.mergeQueue.enqueue(workerId);
+      this.processTeamMergeQueue(team.id);
+      return;
+    }
+
+    if (instanceType === 'em') {
+      logger.info(`Engineering Manager ${workerId} escalated changes - notifying director`);
+      this.directorMergeQueue?.enqueue(workerId);
+      this.processDirectorMergeQueue();
+      void this.assessTeams(`em-${workerId}-merge`).catch(err => {
+        logger.warn('Team assessment failed after EM merge', err);
       });
+      return;
+    }
+
+    logger.info('Director completed merge - checking next team');
+    this.processDirectorMergeQueue();
+    void this.assessTeams('director-merge').catch(err => {
+      logger.warn('Team assessment failed after director merge', err);
+    });
+  }
+
+  private processTeamMergeQueue(teamId: number): void {
+    if (!this.useHierarchy) {
+      return;
+    }
+
+    const team = this.getTeam(teamId);
+    if (!team || team.mergeQueue.isCurrentlyProcessing()) {
+      return;
+    }
+
+    team.mergeQueue.processNext().catch((err: unknown) => {
+      logger.warn(`Failed to process merge queue for EM-${teamId}`, err);
+    });
+  }
+
+  private processManagerMergeQueue(): void {
+    if (!this.managerMergeQueue || this.managerMergeQueue.isCurrentlyProcessing()) {
+      return;
+    }
+
+    this.managerMergeQueue.processNext().catch((err: unknown) => {
+      logger.warn('Failed to process manager merge queue', err);
+    });
+  }
+
+  private processDirectorMergeQueue(): void {
+    if (!this.useHierarchy || !this.directorMergeQueue || this.directorMergeQueue.isCurrentlyProcessing()) {
+      return;
+    }
+
+    this.directorMergeQueue.processNext().catch((err: unknown) => {
+      logger.error('Failed to process director merge queue', err);
+    });
+  }
+
+  private async notifyEngineeringManagerOfCompletion(teamId: number, workerId: number): Promise<void> {
+    if (!this.useHierarchy) {
+      return;
+    }
+
+    const team = this.getTeam(teamId);
+    if (!team) {
+      throw new Error(`Team ${teamId} not found`);
+    }
+
+    const emInstance = this.instanceManager.getInstance(team.emInstanceId);
+    const ready = await this.canPromptInstance(emInstance);
+    if (!ready) {
+      logger.info(`EM-${teamId} busy - deferring worker-${workerId} merge prompt`);
+      this.scheduleTeamMergeRetry(teamId, workerId);
+      return;
+    }
+
+    const prompt = `
+You are **Engineering Manager ${teamId} (EM-${teamId})**.
+
+Worker ${workerId} finished a task. Merge their branch into ${team.branchName}:
+
+1. Sync main and worker branch:
+   git fetch origin
+   git checkout ${team.branchName}
+   git pull --rebase origin ${this.config.branch}
+   git merge --no-ff worker-${workerId}
+
+2. Resolve any conflicts, run tests, and update WORKER_${workerId}_TASK_LIST.md with results.
+
+3. Push ${team.branchName} to origin and STOP so the director can review.
+
+4. Review team task priorities and be ready to reassign work if the director reshapes your team.
+    `.trim();
+
+    await this.instanceManager.sendPrompt(team.emInstanceId, prompt);
+    team.priorityScore = Date.now();
+  }
+
+  private async notifyDirectorOfCompletion(teamId: number): Promise<void> {
+    if (!this.useHierarchy || !this.directorMergeQueue) {
+      return;
+    }
+
+    const team = this.getTeam(teamId);
+    if (!team) {
+      throw new Error(`Team ${teamId} not found for director escalation`);
+    }
+
+    const director = this.instanceManager.getInstance('director');
+    const ready = await this.canPromptInstance(director);
+    if (!ready) {
+      logger.info('Director busy - deferring escalation', { teamId });
+      this.scheduleDirectorMergeRetry(teamId);
+      return;
+    }
+
+    const prompt = `
+You are the **Director**. EM-${teamId} has escalated their branch ${team.branchName}.
+
+1. Sync main:
+   git fetch origin
+   git checkout ${this.config.branch}
+   git pull --rebase origin ${this.config.branch}
+
+2. Merge the team branch:
+   git merge --no-ff ${team.branchName}
+
+3. Resolve conflicts, run validations, update high-level direction docs, and push.
+
+4. Assess team priorities and size. Use the data in EM_${teamId}_TASKS.md and worker throughput to decide if you should redistribute workers.
+
+5. If a team must be killed or resized, note it in TEAM_STRUCTURE.md and issue commands to the orchestrator dashboard.
+    `.trim();
+
+    await this.instanceManager.sendPrompt('director', prompt);
+    team.lastAssessment = Date.now();
+  }
+
+  private async canPromptInstance(instance?: ClaudeInstance): Promise<boolean> {
+    if (!instance || instance.status !== 'idle') {
+      return false;
+    }
+    try {
+      return await this.tmux.isAtClaudePrompt(instance.sessionName);
+    } catch (err) {
+      logger.warn('Failed to inspect tmux prompt state', { instanceId: instance?.id, err });
+      return false;
+    }
+  }
+
+  private scheduleTeamMergeRetry(teamId: number, workerId: number, delayMs = 5000): void {
+    if (!this.useHierarchy) {
+      return;
+    }
+    setTimeout(() => {
+      if (this.isShuttingDown) {
+        return;
+      }
+      const team = this.getTeam(teamId);
+      if (!team || team.status !== 'active') {
+        return;
+      }
+      team.mergeQueue.enqueue(workerId);
+      this.processTeamMergeQueue(team.id);
+    }, delayMs);
+  }
+
+  private scheduleDirectorMergeRetry(teamId: number, delayMs = 5000): void {
+    if (!this.useHierarchy || !this.directorMergeQueue) {
+      return;
+    }
+    setTimeout(() => {
+      if (this.isShuttingDown || !this.directorMergeQueue) {
+        return;
+      }
+      this.directorMergeQueue.enqueue(teamId);
+      this.processDirectorMergeQueue();
+    }, delayMs);
+  }
+
+  private async assessTeams(reason: string): Promise<void> {
+    if (this.isShuttingDown || !this.useHierarchy) return;
+
+    logger.debug(`Assessing teams due to ${reason}`);
+    await this.rebalanceTeams();
+  }
+
+  private async rebalanceTeams(): Promise<void> {
+    if (!this.useHierarchy) {
+      return;
+    }
+
+    const activeTeams = this.teams.filter(team => team.status === 'active');
+    if (activeTeams.length === 0) {
+      return;
+    }
+
+    const workerIds = Array.from({ length: this.config.workerCount }, (_, idx) => idx + 1);
+    const baseSize = Math.floor(workerIds.length / activeTeams.length);
+    let remainder = workerIds.length % activeTeams.length;
+    let cursor = 0;
+
+    for (const team of activeTeams.sort((a, b) => a.id - b.id)) {
+      const targetSize = baseSize + (remainder > 0 ? 1 : 0);
+      if (remainder > 0) {
+        remainder--;
+      }
+      const slice = workerIds.slice(cursor, cursor + targetSize);
+      cursor += targetSize;
+      await this.updateTeamAssignments(team, slice);
+    }
+  }
+
+  private async updateTeamAssignments(team: EngineeringTeam, desiredWorkers: number[]): Promise<void> {
+    if (!this.useHierarchy) {
+      return;
+    }
+
+    const currentWorkers = new Set(team.workerIds);
+    const desiredSet = new Set(desiredWorkers);
+
+    const removedWorkers = team.workerIds.filter(id => !desiredSet.has(id));
+    const addedWorkers = desiredWorkers.filter(id => !currentWorkers.has(id));
+
+    if (removedWorkers.length === 0 && addedWorkers.length === 0) {
+      return;
+    }
+
+    team.workerIds = desiredWorkers;
+    desiredWorkers.forEach(workerId => this.workerToTeam.set(workerId, team.id));
+
+    const emUpdate = `
+## Team Roster Update
+
+Your team now manages workers: ${desiredWorkers.map(id => `worker-${id}`).join(', ')}.
+
+Removed: ${removedWorkers.length ? removedWorkers.join(', ') : 'none'}
+Added: ${addedWorkers.length ? addedWorkers.join(', ') : 'none'}
+
+Refresh your task allocations accordingly and update EM_${team.id}_TASKS.md.
+    `.trim();
+
+    try {
+      await this.instanceManager.sendPrompt(team.emInstanceId, emUpdate);
+    } catch (err) {
+      logger.warn(`Failed to notify EM-${team.id} about roster change`, err);
+    }
+
+    for (const workerId of addedWorkers) {
+      const workerPrompt = `
+## Team Assignment Update
+
+You now report to EM-${team.id}. Fetch ${team.branchName} for context and follow EM_${team.id}_TASKS.md.
+      `.trim();
+      try {
+        await this.instanceManager.sendPrompt(`worker-${workerId}`, workerPrompt);
+      } catch (err) {
+        logger.warn(`Failed to notify worker-${workerId} about new EM`, err);
+      }
     }
   }
 
@@ -904,67 +1336,71 @@ Start now: Sync and read your task list.
   }
 
   private async notifyManagerOfCompletion(workerId: number): Promise<void> {
+    if (this.useHierarchy || !this.managerMergeQueue) {
+      return;
+    }
+
     const prompt = `
-## Worker ${workerId} Completed
+  ## Worker ${workerId} Completed
 
-Worker ${workerId} pushed to branch \`worker-${workerId}\`.
+  Worker ${workerId} pushed to branch \`worker-${workerId}\`.
 
-## CRITICAL RULES
-- **NEVER ask questions** - make decisions and act
-- **YOU resolve conflicts** - don't tell workers to fix things, fix them yourself
-- **Be decisive** - pick the best resolution and move forward
-- **STAY in ${this.workspaceDir}** - NEVER cd into worker directories
+  ## CRITICAL RULES
+  - **NEVER ask questions** - make decisions and act
+  - **YOU resolve conflicts** - don't tell workers to fix things, fix them yourself
+  - **Be decisive** - pick the best resolution and move forward
+  - **STAY in ${this.workspaceDir}** - NEVER cd into worker directories
 
-## Your Actions
+  ## Your Actions
 
-0. **Verify you're in the right place**:
-   \`\`\`bash
-   pwd  # Must show: ${this.workspaceDir}
-   git status --short  # Must show: On branch ${this.config.branch}
-   \`\`\`
+  0. **Verify you're in the right place**:
+    \`\`\`bash
+    pwd  # Must show: ${this.workspaceDir}
+    git status --short  # Must show: On branch ${this.config.branch}
+    \`\`\`
 
-1. **Fetch and review**:
-   \`\`\`bash
-   git fetch origin worker-${workerId}
-   git diff ${this.config.branch}...origin/worker-${workerId} --stat
-   \`\`\`
+  1. **Fetch and review**:
+    \`\`\`bash
+    git fetch origin worker-${workerId}
+    git diff ${this.config.branch}...origin/worker-${workerId} --stat
+    \`\`\`
 
-2. **Attempt merge**:
-   \`\`\`bash
-   git merge origin/worker-${workerId} --no-ff -m "Merge worker-${workerId}"
-   \`\`\`
+  2. **Attempt merge**:
+    \`\`\`bash
+    git merge origin/worker-${workerId} --no-ff -m "Merge worker-${workerId}"
+    \`\`\`
 
-3. **If merge conflicts occur, RESOLVE THEM**:
-   - For each conflicted file, examine the conflict markers
-   - Use your judgment to combine both changes intelligently
-   - If worker's changes are clearly better: \`git checkout --theirs <file>\`
-   - If existing changes should win: \`git checkout --ours <file>\`
-   - For complex conflicts: edit the file to include both changes properly
-   - After resolving: \`git add <resolved-files> && git commit -m "Merge worker-${workerId} (resolved conflicts)"\`
+  3. **If merge conflicts occur, RESOLVE THEM**:
+    - For each conflicted file, examine the conflict markers
+    - Use your judgment to combine both changes intelligently
+    - If worker's changes are clearly better: \`git checkout --theirs <file>\`
+    - If existing changes should win: \`git checkout --ours <file>\`
+    - For complex conflicts: edit the file to include both changes properly
+    - After resolving: \`git add <resolved-files> && git commit -m "Merge worker-${workerId} (resolved conflicts)"\`
 
-4. **If worker deleted files that shouldn't be deleted**:
-   - Restore them: \`git checkout HEAD -- <file>\`
-   - Then complete the merge
+  4. **If worker deleted files that shouldn't be deleted**:
+    - Restore them: \`git checkout HEAD -- <file>\`
+    - Then complete the merge
 
-5. **Push the merged result**:
-   \`\`\`bash
-   git push origin ${this.config.branch}
-   \`\`\`
+  5. **Push the merged result**:
+    \`\`\`bash
+    git push origin ${this.config.branch}
+    \`\`\`
 
-6. **Update task list**:
-   - Read WORKER_${workerId}_TASK_LIST.md
-   - Move completed task to "Completed" section
-   - If Queue is empty, **CREATE NEW TASKS** based on PROJECT_DIRECTION.md priorities:
-     * Parser Squad: Fix TS1005/TS1109 false positives
-     * Binder Squad: Fix TS2304 error poisoning, lib.d.ts integration
-     * CFA Squad: Edge cases for TS2564/TS2454
-     * Solver Squad: TS2322, TS7006 strictness
-   - Set next "Current Task" from Queue
+  6. **Update task list**:
+    - Read WORKER_${workerId}_TASK_LIST.md
+    - Move completed task to "Completed" section
+    - If Queue is empty, **CREATE NEW TASKS** based on PROJECT_DIRECTION.md priorities:
+      * Parser Squad: Fix TS1005/TS1109 false positives
+      * Binder Squad: Fix TS2304 error poisoning, lib.d.ts integration
+      * CFA Squad: Edge cases for TS2564/TS2454
+      * Solver Squad: TS2322, TS7006 strictness
+    - Set next "Current Task" from Queue
 
-7. **Commit and push task update**
+  7. **Commit and push task update**
 
-8. **STOP**
-    `.trim();
+  8. **STOP**
+      `.trim();
 
     await this.instanceManager.sendPrompt('manager', prompt);
   }
@@ -987,10 +1423,13 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
   }
 
   /**
-   * Manager heartbeat - periodically nudges the manager to check progress.
-   * Ensures manager stays active even without worker events.
+   * Manager heartbeat - used when hierarchy is disabled.
    */
   private startManagerHeartbeat(intervalMs: number): void {
+    if (this.useHierarchy) {
+      return;
+    }
+
     if (this.managerHeartbeatInterval) {
       clearInterval(this.managerHeartbeatInterval);
     }
@@ -1007,25 +1446,23 @@ Worker ${workerId} pushed to branch \`worker-${workerId}\`.
   private async sendManagerHeartbeat(): Promise<void> {
     if (this.isShuttingDown) return;
 
-    const manager = this.instanceManager.getInstance('manager');
-    if (!manager) return;
+    if (!this.useHierarchy) {
+      const manager = this.instanceManager.getInstance('manager');
+      if (!manager) return;
+      if (manager.status !== 'idle') {
+        logger.debug('Manager is busy, skipping heartbeat');
+        return;
+      }
 
-    // Only send heartbeat if manager is idle (not busy with something)
-    if (manager.status !== 'idle') {
-      logger.debug('Manager is busy, skipping heartbeat');
-      return;
-    }
+      const atPrompt = await this.tmux.isAtClaudePrompt(manager.sessionName);
+      if (!atPrompt) {
+        logger.debug('Manager not at prompt, skipping heartbeat');
+        return;
+      }
 
-    // Check if manager is at Claude prompt
-    const atPrompt = await this.tmux.isAtClaudePrompt(manager.sessionName);
-    if (!atPrompt) {
-      logger.debug('Manager not at prompt, skipping heartbeat');
-      return;
-    }
+      logger.info('Sending manager heartbeat');
 
-    logger.info('Sending manager heartbeat');
-
-    const heartbeatPrompt = `
+      const heartbeatPrompt = `
 HEARTBEAT CHECK - Perform routine maintenance. NEVER ask questions, just act.
 
 **IMPORTANT**: Stay in ${this.workspaceDir} - NEVER cd into worker directories.
@@ -1057,8 +1494,84 @@ If everything looks good: Output a one-line status and STOP.
 If action needed: Take the action, then STOP.
 `.trim();
 
-    this.instanceManager.updateStatus('manager', 'busy');
-    await this.instanceManager.sendPrompt('manager', heartbeatPrompt);
+      this.instanceManager.updateStatus('manager', 'busy');
+      await this.instanceManager.sendPrompt('manager', heartbeatPrompt);
+    }
+  }
+
+  /**
+   * Director heartbeat - only runs when hierarchy is enabled.
+   */
+  private startDirectorHeartbeat(intervalMs: number): void {
+    if (this.directorHeartbeatInterval) {
+      clearInterval(this.directorHeartbeatInterval);
+    }
+
+    this.directorHeartbeatInterval = setInterval(() => {
+      this.sendDirectorHeartbeat().catch(err => {
+        logger.error('Director heartbeat failed', err);
+      });
+    }, intervalMs);
+
+    logger.info(`Director heartbeat started (interval: ${intervalMs / 60000} minutes)`);
+  }
+
+  private async sendDirectorHeartbeat(): Promise<void> {
+    if (this.isShuttingDown) return;
+    if (!this.useHierarchy) return;
+
+    const director = this.instanceManager.getInstance('director');
+    if (!director) return;
+
+    if (director.status !== 'idle') {
+      logger.debug('Director is busy, skipping heartbeat');
+      return;
+    }
+
+    const atPrompt = await this.tmux.isAtClaudePrompt(director.sessionName);
+    if (!atPrompt) {
+      logger.debug('Director not at prompt, skipping heartbeat');
+      return;
+    }
+
+    logger.info('Sending director heartbeat');
+
+    const heartbeatPrompt = `
+## DIRECTOR HEARTBEAT
+
+You only coordinate Engineering Managers. NEVER touch worker task lists directly.
+
+1. **Verify repo state**:
+   \`\`\`bash
+   pwd  # must be ${this.workspaceDir}
+   git status --short
+   git fetch origin
+   \`\`\`
+
+2. **Inspect EM branches**:
+   \`\`\`bash
+   for branch in $(git for-each-ref --format='%(refname:short)' refs/heads/em-team-*); do
+     git checkout $branch && git pull --rebase origin $branch || true
+     git log --oneline -5
+   done
+   git checkout ${this.config.branch}
+   \`\`\`
+
+3. **Audit team docs**:
+   - Review TEAM_STRUCTURE.md and every EM_<id>_TASKS.md
+   - Compare worker throughput vs. expectations
+   - Flag EMs that are stalled or producing low-quality escalations
+
+4. **Act**:
+   - Update TEAM_STRUCTURE.md with any roster/size changes
+   - Reassign workers between teams by editing EM_<id>_TASKS.md summaries
+   - If a team must be killed, note it and instruct the orchestrator to rebuild that EM branch
+
+5. **Report**: Output a one-line summary of which teams are healthy vs at risk, then STOP.
+    `.trim();
+
+    this.instanceManager.updateStatus('director', 'busy');
+    await this.instanceManager.sendPrompt('director', heartbeatPrompt);
   }
 
   private async reconcileState(): Promise<void> {
@@ -1135,9 +1648,17 @@ If action needed: Take the action, then STOP.
         // 1. Worker has been idle for 5+ minutes AND
         // 2. We haven't prompted them in the last 5 minutes AND
         // 3. Manager is not currently busy processing merges
+        const team = this.getTeamForWorker(instance.workerId);
+        const teamQueueBusy = team?.mergeQueue.isCurrentlyProcessing() ?? false;
+
+        const orchestratorQueueBusy = this.useHierarchy
+          ? (this.directorMergeQueue?.isCurrentlyProcessing() ?? false)
+          : (this.managerMergeQueue?.isCurrentlyProcessing() ?? false);
+
         if (idleTime > Orchestrator.WORKER_IDLE_THRESHOLD_MS &&
-            timeSinceLastPrompt > Orchestrator.WORKER_PROMPT_COOLDOWN_MS &&
-            !this.mergeQueue.isCurrentlyProcessing()) {
+          timeSinceLastPrompt > Orchestrator.WORKER_PROMPT_COOLDOWN_MS &&
+          !orchestratorQueueBusy &&
+          !teamQueueBusy) {
           logger.info(`Worker ${instance.workerId} idle for ${Math.round(idleTime / 60000)}m, prompting to continue`);
           this.workerLastPromptTime.set(instance.workerId, Date.now());
           await this.promptWorkerToContinue(instance.workerId);
@@ -1221,6 +1742,10 @@ If action needed: Take the action, then STOP.
       clearInterval(this.managerHeartbeatInterval);
       this.managerHeartbeatInterval = null;
     }
+    if (this.directorHeartbeatInterval) {
+      clearInterval(this.directorHeartbeatInterval);
+      this.directorHeartbeatInterval = null;
+    }
 
     this.rateLimitDetector.stop();
     this.stuckDetector.stop();
@@ -1238,11 +1763,26 @@ If action needed: Take the action, then STOP.
   }
 
   getStatus() {
+    const queueSize = this.useHierarchy
+      ? this.directorMergeQueue?.size() ?? 0
+      : this.managerMergeQueue?.size() ?? 0;
+
     return {
       instances: this.instanceManager.getStats(),
       costs: this.costTracker.getStats(),
-      mergeQueueSize: this.mergeQueue.size(),
+      directorQueueSize: queueSize,
+      teams: this.useHierarchy
+        ? this.teams.map(team => ({
+          id: team.id,
+          status: team.status,
+          workers: team.workerIds,
+          queueSize: team.mergeQueue.size(),
+          lastAssessment: team.lastAssessment,
+        }))
+        : [],
+      hierarchyEnabled: this.useHierarchy,
       authConfigsAvailable: this.authConfigs.length,
+      runLogDirectory: this.runLogDir,
     };
   }
 }

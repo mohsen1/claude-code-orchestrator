@@ -37,7 +37,7 @@ export function generateHooksConfig(
   orchestratorUrl: string,
   instanceId: string,
   workerId: number,
-  instanceType: 'manager' | 'worker'
+  instanceType: 'director' | 'em' | 'worker' | 'manager'
 ): ClaudeHooksConfig {
   const basePayload = {
     instance_id: instanceId,
@@ -75,7 +75,7 @@ export function generateClaudeSettings(
   orchestratorUrl: string,
   instanceId: string,
   workerId: number,
-  instanceType: 'manager' | 'worker',
+  instanceType: 'director' | 'em' | 'worker' | 'manager',
   existingSettings: Record<string, unknown> = {}
 ): Record<string, unknown> {
   const hooksConfig = generateHooksConfig(orchestratorUrl, instanceId, workerId, instanceType);

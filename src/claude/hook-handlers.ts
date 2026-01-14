@@ -3,7 +3,7 @@ import { ClaudeInstanceManager } from './instance.js';
 import { logger } from '../utils/logger.js';
 
 export interface HookHandlerCallbacks {
-  onTaskComplete: (workerId: number, instanceType: 'manager' | 'worker') => void;
+  onTaskComplete: (workerId: number, instanceType: 'director' | 'em' | 'worker' | 'manager') => void;
   onError: (instanceId: string, error: unknown) => void;
   onRateLimit: (instanceId: string) => void;
 }

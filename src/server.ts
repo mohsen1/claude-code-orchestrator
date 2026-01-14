@@ -5,7 +5,7 @@ export interface HookPayload {
   hook_name: string;
   instance_id: string;
   worker_id: number;
-  instance_type: 'manager' | 'worker';
+  instance_type: 'director' | 'em' | 'worker' | 'manager';
   data: Record<string, unknown>;
 }
 
@@ -51,7 +51,7 @@ export class HookServer {
         hook_name: String(hookName),
         instance_id: String(req.body.instance_id || ''),
         worker_id: parseInt(String(workerId), 10) || 0,
-        instance_type: req.body.instance_type || 'worker',
+        instance_type: (req.body.instance_type || 'worker') as HookPayload['instance_type'],
         data: req.body.data || {},
       };
 

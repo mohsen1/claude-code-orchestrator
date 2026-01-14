@@ -1,4 +1,6 @@
 import { execa } from 'execa';
+import { mkdir } from 'fs/promises';
+import { dirname } from 'path';
 import { logger } from '../utils/logger.js';
 
 export class TmuxManager {
@@ -13,7 +15,8 @@ export class TmuxManager {
   async createSession(
     sessionName: string,
     cwd: string,
-    env: Record<string, string> = {}
+    env: Record<string, string> = {},
+    logFile?: string
   ): Promise<void> {
     try {
       if (await this.sessionExists(sessionName)) {
@@ -23,6 +26,10 @@ export class TmuxManager {
 
       // 1. Create the session detached in the correct directory
       await execa('tmux', ['new-session', '-d', '-s', sessionName, '-c', cwd]);
+
+      if (logFile) {
+        await this.attachSessionLogger(sessionName, logFile);
+      }
 
       // 2. Set options to prevent auto-rename (cosmetic but helpful for debugging)
       await execa('tmux', ['set-option', '-t', sessionName, 'allow-rename', 'off']);
@@ -62,9 +69,10 @@ export class TmuxManager {
     sessionName: string,
     cwd: string,
     env: Record<string, string> = {},
-    model?: string
+    model?: string,
+    logFile?: string
   ): Promise<void> {
-    await this.createSession(sessionName, cwd, env);
+    await this.createSession(sessionName, cwd, env, logFile);
 
     // Start Claude with optional model
     const claudeCmd = model
@@ -300,5 +308,17 @@ export class TmuxManager {
    */
   getTrackedSessions(): string[] {
     return Array.from(this.sessions);
+  }
+
+  async attachSessionLogger(sessionName: string, logFile: string): Promise<void> {
+    try {
+      await mkdir(dirname(logFile), { recursive: true });
+      const escaped = logFile.replace(/'/g, "'\\''");
+      const command = `exec cat >> '${escaped}'`;
+      await execa('tmux', ['pipe-pane', '-t', sessionName, command]);
+      logger.debug(`Attached logger to ${sessionName}`, { logFile });
+    } catch (err) {
+      logger.warn(`Failed to attach logger to ${sessionName}`, err);
+    }
   }
 }

@@ -1,10 +1,10 @@
 import { parseArgs } from 'node:util';
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, isAbsolute } from 'node:path';
 import { Orchestrator, AuthConfig } from './orchestrator/manager.js';
 import { ConfigLoader } from './config/loader.js';
-import { logger } from './utils/logger.js';
+import { logger, configureLogDirectory } from './utils/logger.js';
 
 async function main(): Promise<void> {
   // Parse command line arguments
@@ -42,10 +42,14 @@ async function main(): Promise<void> {
   }
 
   const workspaceDir = values.workspace ?? '/tmp/orchestrator-workspace';
+  const logBaseDir = await resolveLogBaseDir(values.config);
+  const runLogDir = await createRunLogDirectory(logBaseDir);
+  configureLogDirectory(runLogDir);
 
   logger.info('Claude Code Orchestrator starting...', {
     configDir: values.config,
     workspaceDir,
+    runLogDir,
   });
 
   // Load and validate configuration
@@ -56,11 +60,15 @@ async function main(): Promise<void> {
   try {
     const validated = await loader.validate();
     config = validated.config;
+    config.logDirectory = logBaseDir;
 
     logger.info('Configuration loaded', {
       repository: config.repositoryUrl,
       branch: config.branch,
       workerCount: config.workerCount,
+      engineerManagerGroupSize: config.engineerManagerGroupSize,
+      authMode: config.authMode,
+      logDirectory: config.logDirectory,
     });
   } catch (err) {
     logger.error('Configuration error', err);
@@ -87,7 +95,7 @@ async function main(): Promise<void> {
   }
 
   // Create orchestrator
-  const orchestrator = new Orchestrator(config, workspaceDir, authConfigs);
+  const orchestrator = new Orchestrator(config, workspaceDir, authConfigs, runLogDir);
 
   // Set up signal handlers for graceful shutdown
   setupSignalHandlers(orchestrator);
@@ -102,7 +110,9 @@ async function main(): Promise<void> {
       logger.info('Orchestrator status', {
         instances: status.instances,
         costs: status.costs,
-        mergeQueueSize: status.mergeQueueSize,
+        directorQueueSize: status.directorQueueSize,
+        teams: status.teams,
+          hierarchyEnabled: status.hierarchyEnabled,
         authConfigsAvailable: status.authConfigsAvailable,
       });
     }, 60000);
@@ -290,6 +300,29 @@ Example auth-configs.json (optional):
 
 For more information, see the documentation.
 `);
+}
+
+async function resolveLogBaseDir(configDir: string): Promise<string> {
+  const configPath = join(configDir, 'orchestrator.json');
+  try {
+    const raw = await readFile(configPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    const configured = typeof parsed.logDirectory === 'string' ? parsed.logDirectory.trim() : '';
+    if (configured.length > 0) {
+      return isAbsolute(configured) ? configured : join(configDir, configured);
+    }
+  } catch {
+    // Ignore and fall back to config dir
+  }
+  return configDir;
+}
+
+async function createRunLogDirectory(baseDir: string): Promise<string> {
+  await mkdir(baseDir, { recursive: true });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const runDir = join(baseDir, `run-${timestamp}`);
+  await mkdir(runDir, { recursive: true });
+  return runDir;
 }
 
 // Run main

@@ -41,6 +41,7 @@ describe('ConfigLoader', () => {
       expect(config.repositoryUrl).toBe(validConfig.repositoryUrl);
       expect(config.workerCount).toBe(2);
       expect(config.branch).toBe('main');
+      expect(config.logDirectory).toBe(testDir);
     });
 
     it('should apply default values', async () => {
@@ -63,6 +64,7 @@ describe('ConfigLoader', () => {
       expect(config.maxToolUsesPerInstance).toBe(500);
       expect(config.maxTotalToolUses).toBe(2000);
       expect(config.maxRunDurationMinutes).toBe(120);
+      expect(config.logDirectory).toBe(testDir);
     });
 
     it('should cache loaded config', async () => {
@@ -134,6 +136,17 @@ describe('ConfigLoader', () => {
       );
 
       await expect(loader.loadOrchestratorConfig()).rejects.toThrow();
+    });
+
+    it('should resolve relative logDirectory against config dir', async () => {
+      const relativeDir = 'logs/run-output';
+      await writeFile(
+        join(testDir, 'orchestrator.json'),
+        JSON.stringify({ ...validConfig, logDirectory: relativeDir })
+      );
+
+      const config = await loader.loadOrchestratorConfig();
+      expect(config.logDirectory).toBe(join(testDir, relativeDir));
     });
   });
 

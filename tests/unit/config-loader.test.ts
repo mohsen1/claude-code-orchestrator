@@ -12,7 +12,7 @@ describe('ConfigLoader', () => {
     repositoryUrl: 'https://github.com/test/repo.git',
     branch: 'main',
     workerCount: 2,
-    hookServerPort: 3000,
+    serverPort: 3000,
   };
 
   beforeEach(async () => {
@@ -58,6 +58,7 @@ describe('ConfigLoader', () => {
 
       expect(config.branch).toBe('main');
       expect(config.authMode).toBe('oauth');
+      expect(config.serverPort).toBe(3000);
       expect(config.hookServerPort).toBe(3000);
       expect(config.healthCheckIntervalMs).toBe(30000);
       expect(config.stuckThresholdMs).toBe(300000);
@@ -132,10 +133,28 @@ describe('ConfigLoader', () => {
     it('should reject invalid port numbers', async () => {
       await writeFile(
         join(testDir, 'orchestrator.json'),
-        JSON.stringify({ ...validConfig, hookServerPort: 80 })
+        JSON.stringify({ ...validConfig, serverPort: 80 })
       );
 
       await expect(loader.loadOrchestratorConfig()).rejects.toThrow();
+    });
+
+    it('should support legacy hookServerPort field', async () => {
+      const legacyConfig = {
+        repositoryUrl: validConfig.repositoryUrl,
+        branch: validConfig.branch,
+        workerCount: validConfig.workerCount,
+        hookServerPort: 3100,
+      };
+
+      await writeFile(
+        join(testDir, 'orchestrator.json'),
+        JSON.stringify(legacyConfig)
+      );
+
+      const config = await loader.loadOrchestratorConfig();
+      expect(config.serverPort).toBe(3100);
+      expect(config.hookServerPort).toBe(3100);
     });
 
     it('should resolve relative logDirectory against config dir', async () => {

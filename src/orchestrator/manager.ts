@@ -150,7 +150,7 @@ export class Orchestrator {
     this.logBaseDir = this.config.logDirectory ?? workspaceDir;
 
     // Initialize components
-    this.hookServer = new HookServer(config.hookServerPort);
+    this.hookServer = new HookServer(config.serverPort);
     this.tmux = new TmuxManager();
     this.instanceManager = new ClaudeInstanceManager(this.tmux);
 
@@ -232,7 +232,7 @@ export class Orchestrator {
       logger.info('Orchestrator started successfully', {
         mode: canResume ? 'resumed' : 'fresh',
         workerCount: this.config.workerCount,
-        hookPort: this.config.hookServerPort,
+        serverPort: this.config.serverPort,
         workspace: this.workspaceDir,
         authMode: this.config.authMode,
         startupAuth: this.getStartupAuthConfig()?.name ?? 'OAuth',
@@ -693,7 +693,7 @@ Continue working autonomously. NEVER ask questions.
     await this.ensureClaudeIgnored(workDir);
 
     // Write hooks configuration to Claude settings.json
-    const orchestratorUrl = `http://localhost:${this.config.hookServerPort}`;
+    const orchestratorUrl = `http://localhost:${this.config.serverPort}`;
     const settings = generateClaudeSettings(orchestratorUrl, id, workerId, type, { env });
     const claudeDir = join(workDir, '.claude');
     await mkdir(claudeDir, { recursive: true });

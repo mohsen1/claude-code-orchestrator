@@ -55,7 +55,7 @@ Create a config directory with the following files:
 | `envFiles` | string[] | *none* | Paths to env files to copy to each worktree (see [Environment Files](#environment-files)) |
 | `workerCount` | number | *required* | Number of worker instances (1-20) |
 | `engineerManagerGroupSize` | number | `4` | Maximum workers per Engineering Manager team (1-8). If `workerCount` exceeds this value the Director/EM hierarchy is enabled; otherwise the legacy manager→worker flow runs. |
-| `hookServerPort` | number | `3000` | Port for the internal hook server (1024-65535) |
+| `serverPort` (`hookServerPort`) | number | `3000` | Port for the internal hook server (1024-65535). `hookServerPort` is kept for backward compatibility. |
 | `healthCheckIntervalMs` | number | `30000` | Health check polling interval in milliseconds (min: 5000) |
 | `rateLimitCheckIntervalMs` | number | `10000` | Rate limit detection interval in milliseconds (min: 5000) |
 | `stuckThresholdMs` | number | `300000` | Time without tool use before instance is considered stuck (min: 60000) |

@@ -257,7 +257,7 @@ async function createTestConfig(branchName: string): Promise<string> {
   await mkdir(configDir, { recursive: true });
 
   const engineerManagerGroupSize = Math.min(8, Math.max(1, WORKER_COUNT - 1));
-  const hookServerPort = 20000 + Math.floor(Math.random() * 30000);
+  const serverPort = 20000 + Math.floor(Math.random() * 30000);
 
   const config = {
     repositoryUrl: `git@github.com:${TEST_REPO}.git`,
@@ -265,7 +265,7 @@ async function createTestConfig(branchName: string): Promise<string> {
     model: MODEL,
     workerCount: WORKER_COUNT,
     engineerManagerGroupSize,
-    hookServerPort,
+    serverPort,
     stuckThresholdMs: 180000, // 3 minutes
     managerHeartbeatIntervalMs: 120000, // 2 minutes
     maxRunDurationMinutes: DURATION_MINUTES + 2,

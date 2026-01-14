@@ -105,7 +105,8 @@ export class Orchestrator {
 
   // Auth configs for rotation (OAuth is used by default when no config is set)
   private authConfigs: AuthConfig[] = [];
-  private authConfigIndex = 0;
+  private authRotationPool: Array<AuthConfig | null> = [];
+  private authRotationIndex = 0;
 
   // Track when each worker was last prompted to prevent over-prompting
   private workerLastPromptTime: Map<number, number> = new Map();
@@ -119,6 +120,9 @@ export class Orchestrator {
   ) {
     this.workspaceDir = workspaceDir;
     this.authConfigs = authConfigs;
+    this.validateAuthMode();
+    this.authRotationPool = this.buildAuthRotationPool();
+    this.authRotationIndex = 0;
 
     // Initialize components
     this.hookServer = new HookServer(config.hookServerPort);
@@ -192,10 +196,9 @@ export class Orchestrator {
         workerCount: this.config.workerCount,
         hookPort: this.config.hookServerPort,
         workspace: this.workspaceDir,
+        authMode: this.config.authMode,
+        startupAuth: this.getStartupAuthConfig()?.name ?? 'OAuth',
         authConfigsAvailable: this.authConfigs.length,
-        authMode: this.authConfigs.length > 0
-          ? `hybrid (OAuth + ${this.authConfigs.map(c => c.name).join(', ')})`
-          : 'OAuth only',
       });
     } catch (err) {
       logger.error('Failed to start orchestrator', err);
@@ -470,13 +473,15 @@ Continue working autonomously. NEVER ask questions.
   }
 
   private async createInstances(resumeMode: boolean = false): Promise<void> {
+    const startupAuth = this.getStartupAuthConfig();
+
     // Create or reconnect manager instance
-    await this.createInstance('manager', 'manager', 0, this.workspaceDir, undefined, resumeMode);
+    await this.createInstance('manager', 'manager', 0, this.workspaceDir, startupAuth ?? undefined, resumeMode);
 
     // Create or reconnect worker instances
     for (let i = 1; i <= this.config.workerCount; i++) {
       const worktreePath = `${this.workspaceDir}/worktrees/worker-${i}`;
-      await this.createInstance(`worker-${i}`, 'worker', i, worktreePath, undefined, resumeMode);
+      await this.createInstance(`worker-${i}`, 'worker', i, worktreePath, startupAuth ?? undefined, resumeMode);
     }
 
     logger.info(`${resumeMode ? 'Reconnected to' : 'Created'} ${this.config.workerCount + 1} Claude instances`);
@@ -611,16 +616,54 @@ Please resume. Check git status and recent changes.
   }
 
   /**
-   * Get next auth config for rotation. Returns null to use OAuth.
+   * Build the auth rotation pool based on configured mode.
+   * - oauth: OAuth first, then API keys
+   * - api-keys-first: API keys first, then OAuth
+   * - api-keys-only: API keys only (no OAuth fallback)
+   */
+  private buildAuthRotationPool(): Array<AuthConfig | null> {
+    if (this.config.authMode === 'api-keys-only') {
+      return [...this.authConfigs];
+    }
+
+    if (this.config.authMode === 'api-keys-first') {
+      if (this.authConfigs.length === 0) {
+        logger.warn('authMode "api-keys-first" requested but no auth configs found; falling back to OAuth');
+        return [null];
+      }
+      return [...this.authConfigs, null];
+    }
+
+    // Default oauth mode
+    return this.authConfigs.length > 0 ? [null, ...this.authConfigs] : [null];
+  }
+
+  private validateAuthMode(): void {
+    if (this.config.authMode === 'api-keys-only' && this.authConfigs.length === 0) {
+      throw new Error('authMode "api-keys-only" requires at least one auth config in auth-configs.json');
+    }
+  }
+
+  /**
+   * Get the configured startup auth (first entry in the pool).
+   */
+  private getStartupAuthConfig(): AuthConfig | null {
+    if (this.authRotationPool.length === 0) {
+      return null;
+    }
+    return this.authRotationPool[0];
+  }
+
+  /**
+   * Rotate to the next auth config. Returns null when OAuth should be used.
    */
   private getNextAuthConfig(): AuthConfig | null {
-    if (this.authConfigs.length === 0) return null;
+    if (this.authRotationPool.length === 0) {
+      return null;
+    }
 
-    // Cycle through configs, returning null occasionally to try OAuth
-    this.authConfigIndex = (this.authConfigIndex + 1) % (this.authConfigs.length + 1);
-
-    if (this.authConfigIndex === 0) return null; // Use OAuth
-    return this.authConfigs[this.authConfigIndex - 1];
+    this.authRotationIndex = (this.authRotationIndex + 1) % this.authRotationPool.length;
+    return this.authRotationPool[this.authRotationIndex] ?? null;
   }
 
   private async handleStuckInstance(instanceId: string): Promise<void> {

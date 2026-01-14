@@ -24,7 +24,7 @@ npm install
 # Build
 npm run build
 
-# Run (uses host OAuth by default, or auth-configs.json for rotation)
+# Run (uses authMode from orchestrator.json; defaults to OAuth)
 npm start -- --config ./config
 ```
 
@@ -50,6 +50,7 @@ Create a config directory with the following files:
 | `branch` | string | `"main"` | Branch to check out and work from |
 | `cloneDepth` | number | *none* | Shallow clone depth (e.g., `1` for latest commit only) |
 | `model` | string | *none* | Claude model to use (`haiku`, `sonnet`, `opus`) |
+| `authMode` | string | `"oauth"` | Auth startup mode: `oauth`, `api-keys-first`, or `api-keys-only` |
 | `envFiles` | string[] | *none* | Paths to env files to copy to each worktree (see [Environment Files](#environment-files)) |
 | `workerCount` | number | *required* | Number of worker instances (1-20) |
 | `hookServerPort` | number | `3000` | Port for the internal hook server (1024-65535) |
@@ -61,9 +62,9 @@ Create a config directory with the following files:
 | `maxTotalToolUses` | number | `2000` | Maximum total tool invocations across all instances (min: 500) |
 | `maxRunDurationMinutes` | number | `120` | Maximum orchestrator run time in minutes (min: 10) |
 
-### api-keys.json (optional, for rate limit rotation)
+### auth-configs.json (optional, for rate limit rotation)
 
-Configure API keys for rate limit rotation. Each entry specifies environment variables to apply.
+Configure API keys for rate limit rotation. Legacy name `api-keys.json` is still accepted. Each entry specifies environment variables to apply.
 
 ```json
 [
@@ -76,6 +77,34 @@ Configure API keys for rate limit rotation. Each entry specifies environment var
 |-------|----------|-------------|
 | `name` | Yes | Identifier for this API key config |
 | `env` | Yes | Environment variables to apply (e.g., `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`) |
+
+### Authentication modes
+
+Control how the orchestrator starts and rotates auth:
+
+- `oauth` (default): Start with OAuth, rotate to API keys on rate limits.
+- `api-keys-first`: Start with the first entry in `auth-configs.json`, fall back to OAuth when the pool wraps.
+- `api-keys-only`: Always use API keys. Requires `auth-configs.json`; the orchestrator will exit if none are provided.
+
+Example `orchestrator.json` using keys first:
+
+```json
+{
+  "repositoryUrl": "https://github.com/org/repo.git",
+  "branch": "main",
+  "workerCount": 2,
+  "authMode": "api-keys-first"
+}
+```
+
+Example `auth-configs.json`:
+
+```json
+[
+  { "name": "primary-key", "env": { "ANTHROPIC_API_KEY": "sk-ant-..." } },
+  { "name": "zai", "env": { "ANTHROPIC_AUTH_TOKEN": "...", "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic" } }
+]
+```
 
 ## Architecture
 

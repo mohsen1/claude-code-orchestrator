@@ -70,6 +70,15 @@ async function main(): Promise<void> {
   // Load auth configs (optional - OAuth is used by default)
   const authConfigs = await loadAuthConfigs(values.config);
 
+  if (config.authMode === 'api-keys-only' && authConfigs.length === 0) {
+    logger.error('authMode "api-keys-only" is set but no auth-configs.json was found or it is empty');
+    process.exit(1);
+  }
+
+  if (config.authMode === 'api-keys-first' && authConfigs.length === 0) {
+    logger.warn('authMode "api-keys-first" requested but no auth-configs.json found; falling back to OAuth');
+  }
+
   if (authConfigs.length > 0) {
     logger.info(`Loaded ${authConfigs.length} auth config(s) for rotation: ${authConfigs.map(c => c.name).join(', ')}`);
   } else {
@@ -246,7 +255,11 @@ Options:
 
 Authentication:
   By default, Claude uses your local OAuth credentials (~/.claude).
-  To enable auth rotation (for rate limit handling), create auth-configs.json.
+  To control auth startup/rotation, set authMode in orchestrator.json:
+    - oauth (default): start with OAuth, then rotate into auth-configs.json
+    - api-keys-first: start with first entry in auth-configs.json, then OAuth
+    - api-keys-only: use only auth-configs.json (required)
+  Provide auth-configs.json (or legacy api-keys.json) to supply API keys.
 
 Config Directory Structure:
   <config-dir>/

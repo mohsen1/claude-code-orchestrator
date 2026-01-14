@@ -7,6 +7,7 @@ export const OrchestratorConfigSchema = z.object({
   repositoryUrl: z.string().regex(gitUrlPattern, { message: 'Repository URL must be a valid git URL (HTTPS or SSH)' }),
   branch: z.string().default('main'),
   model: z.string().optional(), // Claude model: 'haiku', 'sonnet', 'opus', or full model name
+  authMode: z.enum(['oauth', 'api-keys-first', 'api-keys-only']).default('oauth'),
   cloneDepth: z.number().int().min(1).optional(), // shallow clone depth
   envFiles: z.array(z.string()).optional(), // Paths to env files to copy to each worker worktree (e.g., ["/path/to/.env.local"])
   workerCount: z.number().int().min(1).max(20),

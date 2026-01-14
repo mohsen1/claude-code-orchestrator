@@ -56,6 +56,7 @@ describe('ConfigLoader', () => {
       const config = await loader.loadOrchestratorConfig();
 
       expect(config.branch).toBe('main');
+      expect(config.authMode).toBe('oauth');
       expect(config.hookServerPort).toBe(3000);
       expect(config.healthCheckIntervalMs).toBe(30000);
       expect(config.stuckThresholdMs).toBe(300000);

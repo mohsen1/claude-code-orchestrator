@@ -21,6 +21,8 @@ const RATE_LIMIT_PATTERNS = [
 export class RateLimitDetector {
   private checkInterval: NodeJS.Timeout | null = null;
   private readonly patterns: RegExp[];
+  private lastHandledTime: Map<string, number> = new Map();
+  private static readonly COOLDOWN_MS = 120000; // 2 minutes cooldown after handling
 
   constructor(
     private tmux: TmuxManager,
@@ -65,15 +67,29 @@ export class RateLimitDetector {
   }
 
   private async checkInstance(instanceId: string, sessionName: string): Promise<void> {
+    // Skip if we recently handled a rate limit for this instance (cooldown period)
+    const lastHandled = this.lastHandledTime.get(instanceId) || 0;
+    if (Date.now() - lastHandled < RateLimitDetector.COOLDOWN_MS) {
+      logger.debug(`Skipping rate limit check for ${instanceId} (in cooldown)`);
+      return;
+    }
+
     try {
       const output = await this.tmux.capturePane(sessionName, 200);
 
+      // Filter out orchestrator log lines to avoid self-triggering
+      const filteredOutput = output
+        .split('\n')
+        .filter(line => !line.match(/^\d{4}-\d{2}-\d{2}.*\[(info|warn|error|debug)\]:/))
+        .join('\n');
+
       for (const pattern of this.patterns) {
-        if (pattern.test(output)) {
+        if (pattern.test(filteredOutput)) {
           logger.warn(`Rate limit detected for ${instanceId}`, {
             pattern: pattern.toString(),
           });
 
+          this.lastHandledTime.set(instanceId, Date.now());
           await this.onRateLimitDetected(instanceId);
           break; // Only trigger once per check
         }
@@ -111,5 +127,20 @@ export class RateLimitDetector {
   addPattern(pattern: RegExp): void {
     this.patterns.push(pattern);
     logger.debug(`Added rate limit pattern: ${pattern.toString()}`);
+  }
+
+  /**
+   * Clear cooldown for an instance (e.g., after successful recovery).
+   */
+  clearCooldown(instanceId: string): void {
+    this.lastHandledTime.delete(instanceId);
+  }
+
+  /**
+   * Check if an instance is currently in cooldown.
+   */
+  isInCooldown(instanceId: string): boolean {
+    const lastHandled = this.lastHandledTime.get(instanceId) || 0;
+    return Date.now() - lastHandled < RateLimitDetector.COOLDOWN_MS;
   }
 }

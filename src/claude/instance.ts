@@ -26,6 +26,7 @@ export interface ClaudeInstance {
   apiKey?: string; // If set, uses this key instead of OAuth
   model?: string; // Claude model to use (e.g., 'haiku', 'sonnet', 'opus')
   logFile?: string; // Path to the tmux log file
+  sessionEnv?: Record<string, string>; // Env vars used to create the tmux session
 }
 
 export class ClaudeInstanceManager {
@@ -57,40 +58,54 @@ export class ClaudeInstanceManager {
 
     const dir = workDir ?? instance.workDir;
 
-    // 1. Check if at shell prompt (Claude crashed) and restart if needed
-    const didRestart = await this.tmux.ensureClaudeRunning(instance.sessionName, dir, instance.model);
-    if (didRestart) {
-      logger.info(`Restarted Claude for ${instanceId} before sending prompt`);
-      // Wait for Claude to fully initialize after restart
-      await new Promise(r => setTimeout(r, 5000));
+    const sendOnce = async (): Promise<boolean> => {
+      // 1. Check if at shell prompt (Claude crashed) and restart if needed
+      const didRestart = await this.tmux.ensureClaudeRunning(instance.sessionName, dir, instance.model);
+      if (didRestart) {
+        logger.info(`Restarted Claude for ${instanceId} before sending prompt`);
+        // Wait for Claude to fully initialize after restart
+        await new Promise(r => setTimeout(r, 5000));
+      }
+
+      // 2. Clear the screen for a clean slate
+      await this.tmux.sendControlKey(instance.sessionName, 'C-l');
+      await new Promise(r => setTimeout(r, 500));
+
+      // 3. Check if at Claude prompt (waiting for input)
+      const atPrompt = await this.tmux.isAtClaudePrompt(instance.sessionName);
+      if (!atPrompt) {
+        // Might be in the middle of something, send Ctrl+C first
+        logger.debug(`Instance ${instanceId} not at prompt, sending Ctrl+C first`);
+        await this.tmux.sendControlKey(instance.sessionName, 'C-c');
+        await new Promise(r => setTimeout(r, 2000));
+      }
+
+      // 4. Update instance state
+      instance.status = 'busy';
+      instance.currentTask = prompt.substring(0, 100);
+      instance.currentTaskFull = prompt;
+      instance.lastToolUse = new Date(); // Reset stuck timer
+
+      // 5. Send the prompt
+      await this.tmux.sendKeys(instance.sessionName, prompt);
+
+      logger.debug(`Sent prompt to ${instanceId}`, {
+        taskPreview: instance.currentTask,
+        didRestart,
+      });
+
+      return didRestart;
+    };
+
+    try {
+      await sendOnce();
+      return;
+    } catch (err) {
+      logger.warn(`Failed to send prompt to ${instanceId}, restarting session`, err);
     }
 
-    // 2. Clear the screen for a clean slate
-    await this.tmux.sendControlKey(instance.sessionName, 'C-l');
-    await new Promise(r => setTimeout(r, 500));
-
-    // 3. Check if at Claude prompt (waiting for input)
-    const atPrompt = await this.tmux.isAtClaudePrompt(instance.sessionName);
-    if (!atPrompt) {
-      // Might be in the middle of something, send Ctrl+C first
-      logger.debug(`Instance ${instanceId} not at prompt, sending Ctrl+C first`);
-      await this.tmux.sendControlKey(instance.sessionName, 'C-c');
-      await new Promise(r => setTimeout(r, 2000));
-    }
-
-    // 4. Update instance state
-    instance.status = 'busy';
-    instance.currentTask = prompt.substring(0, 100);
-    instance.currentTaskFull = prompt;
-    instance.lastToolUse = new Date(); // Reset stuck timer
-
-    // 5. Send the prompt
-    await this.tmux.sendKeys(instance.sessionName, prompt);
-
-    logger.debug(`Sent prompt to ${instanceId}`, {
-      taskPreview: instance.currentTask,
-      didRestart,
-    });
+    await this.restartSession(instance);
+    await sendOnce();
   }
 
   /**
@@ -113,7 +128,13 @@ export class ClaudeInstanceManager {
       throw new Error(`Instance ${instanceId} not found`);
     }
 
-    await this.tmux.sendControlKey(instance.sessionName, 'C-c');
+    try {
+      await this.tmux.sendControlKey(instance.sessionName, 'C-c');
+    } catch (err) {
+      logger.warn(`Failed to interrupt ${instanceId}, restarting session`, err);
+      await this.restartSession(instance);
+      await this.tmux.sendControlKey(instance.sessionName, 'C-c');
+    }
     logger.info(`Interrupted instance: ${instanceId}`);
   }
 
@@ -202,6 +223,18 @@ export class ClaudeInstanceManager {
       this.instances.delete(instanceId);
       logger.info(`Destroyed instance: ${instanceId}`);
     }
+  }
+
+  private async restartSession(instance: ClaudeInstance): Promise<void> {
+    logger.warn(`Restarting tmux session for ${instance.id}`);
+    await this.tmux.createSessionWithClaude(
+      instance.sessionName,
+      instance.workDir,
+      instance.sessionEnv ?? {},
+      instance.model,
+      instance.logFile
+    );
+    await new Promise(r => setTimeout(r, 5000));
   }
 
   async destroyAll(): Promise<void> {

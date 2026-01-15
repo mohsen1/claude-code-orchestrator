@@ -16,6 +16,7 @@ import { ClaudeInstanceManager, ClaudeInstance, InstanceStatus, InstanceType } f
 import { RateLimitDetector } from '../claude/rate-limit-detector.js';
 import { registerHookHandlers } from '../claude/hook-handlers.js';
 import { GitManager } from '../git/worktree.js';
+import { clearStaleGitLocks, getGitDir, runGit } from '../git/safety.js';
 import { CostTracker, CostLimits } from './cost-tracker.js';
 import { StuckDetector } from './stuck-detector.js';
 import { generateClaudeSettings } from '../claude/hooks.js';
@@ -32,6 +33,9 @@ export interface QueueItem {
   id: number;
   attemptCount: number;
   enqueuedAt: number;
+  lastAttemptAt?: number;
+  lastError?: string;
+  status?: 'queued' | 'processing' | 'retrying' | 'failed';
 }
 
 /**
@@ -40,6 +44,7 @@ export interface QueueItem {
 export interface QueueState {
   queue: QueueItem[];
   lastProcessTime: number;
+  lastUpdatedAt?: number;
   version: number; // for future schema migrations
 }
 
@@ -76,7 +81,20 @@ export class MergeQueue {
       const state: QueueState = JSON.parse(data);
       
       if (state.version === 1) {
-        this.queue = state.queue;
+        this.queue = state.queue.map(item => ({
+          ...item,
+          status: item.status ?? 'queued',
+        }));
+        this.lastProcessTime = state.lastProcessTime;
+        logger.info(`Merge queue: restored ${this.queue.length} items from ${this.statePath}`);
+        return;
+      }
+
+      if (state.version === 2) {
+        this.queue = state.queue.map(item => ({
+          ...item,
+          status: item.status ?? 'queued',
+        }));
         this.lastProcessTime = state.lastProcessTime;
         logger.info(`Merge queue: restored ${this.queue.length} items from ${this.statePath}`);
       }
@@ -97,7 +115,8 @@ export class MergeQueue {
       const state: QueueState = {
         queue: this.queue,
         lastProcessTime: this.lastProcessTime,
-        version: 1
+        lastUpdatedAt: Date.now(),
+        version: 2,
       };
       await writeFile(this.statePath, JSON.stringify(state, null, 2), 'utf-8');
     } catch (err) {
@@ -112,7 +131,8 @@ export class MergeQueue {
       this.queue.push({
         id: workerId,
         attemptCount: 0,
-        enqueuedAt: Date.now()
+        enqueuedAt: Date.now(),
+        status: 'queued',
       });
       logger.info(`Merge queue: added worker-${workerId} (queue size: ${this.queue.length})`);
       this.saveState().catch(err => logger.error('Failed to save queue state after enqueue', err));
@@ -134,6 +154,8 @@ export class MergeQueue {
     let success = false;
 
     try {
+      item.lastAttemptAt = Date.now();
+      item.status = 'processing';
       logger.info(`Merge queue: processing worker-${item.id} (attempt ${item.attemptCount + 1}/${MergeQueue.MAX_ATTEMPTS}, ${this.queue.length} remaining)`);
       await this.processFunc(item.id);
       success = true;
@@ -144,9 +166,12 @@ export class MergeQueue {
       
       // Increment attempt count
       item.attemptCount++;
+      item.lastError = err instanceof Error ? err.message : String(err);
+      item.status = 'retrying';
       
       if (item.attemptCount >= MergeQueue.MAX_ATTEMPTS) {
         logger.error(`Merge queue: worker-${item.id} exceeded max attempts (${MergeQueue.MAX_ATTEMPTS}), escalating`);
+        item.status = 'failed';
         
         // Call escalation handler if provided
         if (this.onMaxAttemptsExceeded) {
@@ -188,12 +213,24 @@ export class MergeQueue {
   /**
    * Get queue items for health monitoring
    */
-  getQueueItems(): Array<{ id: number; attemptCount: number; ageMs: number }> {
+  getQueueItems(): Array<{
+    id: number;
+    attemptCount: number;
+    ageMs: number;
+    enqueuedAt: number;
+    lastAttemptAt?: number;
+    lastError?: string;
+    status?: QueueItem['status'];
+  }> {
     const now = Date.now();
     return this.queue.map(item => ({
       id: item.id,
       attemptCount: item.attemptCount,
-      ageMs: now - item.enqueuedAt
+      ageMs: now - item.enqueuedAt,
+      enqueuedAt: item.enqueuedAt,
+      lastAttemptAt: item.lastAttemptAt,
+      lastError: item.lastError,
+      status: item.status,
     }));
   }
 }
@@ -447,13 +484,13 @@ export class Orchestrator {
       }
 
       // Check if we're on the right branch
-      const result = await execa('git', ['-C', this.workspaceDir, 'branch', '--show-current'], { reject: false });
+      const result = await runGit(this.workspaceDir, ['branch', '--show-current'], { allowFailure: true, timeoutMs: 10000 });
       if (result.exitCode !== 0) {
         logger.debug('Could not get current branch');
         return false;
       }
 
-      const currentBranch = result.stdout.trim();
+      const currentBranch = String(result.stdout ?? '').trim();
       if (currentBranch !== this.config.branch) {
         logger.debug(`Wrong branch: ${currentBranch} (expected ${this.config.branch})`);
         return false;
@@ -489,9 +526,8 @@ export class Orchestrator {
 
     this.git = new GitManager(this.workspaceDir);
 
-    // Pull latest on main workspace
-    await execa('git', ['-C', this.workspaceDir, 'fetch', 'origin'], { reject: false });
-    await execa('git', ['-C', this.workspaceDir, 'reset', '--hard', `origin/${this.config.branch}`], { reject: false });
+    // Pull latest on main workspace without discarding local commits
+    await this.syncBranchToOrigin(this.workspaceDir, this.config.branch, 'workspace');
 
     // Copy env files to main workspace (in case they changed)
     await this.copyConfigEnvFiles(this.workspaceDir);
@@ -505,21 +541,19 @@ export class Orchestrator {
         // Worktree exists - just sync it (but preserve local commits on worker branch)
         logger.debug(`Syncing existing worktree for worker-${i}`);
         const branchName = `worker-${i}`;
-        await execa('git', ['-C', worktreePath, 'fetch', 'origin'], { reject: false });
-        // Check if the worker branch exists on origin, if so reset to it; otherwise just stay on current
-        const { exitCode } = await execa('git', ['-C', worktreePath, 'rev-parse', '--verify', `origin/${branchName}`], { reject: false });
-        if (exitCode === 0) {
-          // Worker branch exists on origin - reset to it (preserves worker's pushed work)
-          await execa('git', ['-C', worktreePath, 'reset', '--hard', `origin/${branchName}`], { reject: false });
-        }
+        await this.syncBranchToOrigin(worktreePath, branchName, `worker-${i}`);
         // If worker branch doesn't exist on origin, leave worktree as-is to preserve local work
         await this.copyEnvFiles(this.workspaceDir, worktreePath);
       } else {
         // Worktree missing - create it
         logger.info(`Creating missing worktree for worker-${i}`);
         const branchName = `worker-${i}`;
-        await execa('git', ['-C', this.workspaceDir, 'branch', branchName], { reject: false });
-        await execa('git', ['-C', this.workspaceDir, 'worktree', 'add', worktreePath, branchName]);
+        try {
+          await runGit(this.workspaceDir, ['branch', branchName], { allowFailure: true });
+        } catch (err) {
+          logger.warn(`Failed to create branch ${branchName}`, err);
+        }
+        await runGit(this.workspaceDir, ['worktree', 'add', worktreePath, branchName], { timeoutMs: 20000 });
         await this.copyEnvFiles(this.workspaceDir, worktreePath);
       }
     }
@@ -596,6 +630,7 @@ The orchestrator has been restarted. Resume your work.
 2. Read your task list: \`cat WORKER_${workerId}_TASK_LIST.md\` (maintained by ${teamLabel})
 3. Work on your Current Task
 4. When done: commit, push to worker-${workerId}, and STOP
+   Do not force push. If push is rejected, stop and report.
 
 Continue working autonomously. NEVER ask questions.
     `.trim();
@@ -636,8 +671,12 @@ Continue working autonomously. NEVER ask questions.
       const branchName = `worker-${i}`;
       const worktreePath = `${worktreesDir}/worker-${i}`;
 
-      await execa('git', ['-C', this.workspaceDir, 'branch', branchName], { reject: false });
-      await execa('git', ['-C', this.workspaceDir, 'worktree', 'add', worktreePath, branchName]);
+      try {
+        await runGit(this.workspaceDir, ['branch', branchName], { allowFailure: true });
+      } catch (err) {
+        logger.warn(`Failed to create branch ${branchName}`, err);
+      }
+      await runGit(this.workspaceDir, ['worktree', 'add', worktreePath, branchName], { timeoutMs: 20000 });
       await this.copyEnvFiles(this.workspaceDir, worktreePath);
 
       logger.info(`Created worktree for worker-${i}`, { path: worktreePath });
@@ -713,6 +752,154 @@ Continue working autonomously. NEVER ask questions.
     }
   }
 
+  private async getWorktreeStatus(workDir: string): Promise<string[]> {
+    try {
+      const result = await runGit(workDir, ['status', '--porcelain'], { allowFailure: true, timeoutMs: 10000 });
+      if (result.exitCode !== 0) {
+        return [];
+      }
+      const stdout = String(result.stdout ?? '');
+      return stdout.split('\n').map((line: string) => line.trim()).filter(Boolean);
+    } catch (err) {
+      logger.warn('Failed to read git status', { workDir, err });
+      return [];
+    }
+  }
+
+  private async getWorktreeConflicts(workDir: string): Promise<string[]> {
+    try {
+      const result = await runGit(workDir, ['diff', '--name-only', '--diff-filter=U'], {
+        allowFailure: true,
+        timeoutMs: 10000,
+      });
+      if (result.exitCode !== 0) {
+        return [];
+      }
+      const stdout = String(result.stdout ?? '');
+      return stdout.split('\n').map((line: string) => line.trim()).filter(Boolean);
+    } catch (err) {
+      logger.warn('Failed to read merge conflicts', { workDir, err });
+      return [];
+    }
+  }
+
+  private async getBranchDivergence(
+    workDir: string,
+    branchName: string
+  ): Promise<{ ahead: number; behind: number } | null> {
+    try {
+      const verify = await runGit(workDir, ['rev-parse', '--verify', `origin/${branchName}`], {
+        allowFailure: true,
+        timeoutMs: 10000,
+      });
+      if (verify.exitCode !== 0) {
+        return null;
+      }
+
+      const result = await runGit(workDir, ['rev-list', '--left-right', '--count', `origin/${branchName}...${branchName}`], {
+        allowFailure: true,
+        timeoutMs: 10000,
+      });
+      if (result.exitCode !== 0) {
+        return null;
+      }
+      const [behindRaw, aheadRaw] = String(result.stdout ?? '').trim().split('\t');
+      const behind = Number(behindRaw);
+      const ahead = Number(aheadRaw);
+      if (Number.isNaN(behind) || Number.isNaN(ahead)) {
+        return null;
+      }
+      return { ahead, behind };
+    } catch (err) {
+      logger.warn('Failed to compute branch divergence', { workDir, branchName, err });
+      return null;
+    }
+  }
+
+  private async syncBranchToOrigin(workDir: string, branchName: string, label: string): Promise<void> {
+    await clearStaleGitLocks(workDir);
+    try {
+      await runGit(workDir, ['fetch', 'origin'], { allowFailure: true });
+    } catch (err) {
+      logger.warn(`Failed to fetch origin for ${label}`, { workDir, err });
+      return;
+    }
+
+    const statusLines = await this.getWorktreeStatus(workDir);
+    if (statusLines.length > 0) {
+      logger.warn(`Worktree ${label} has uncommitted changes; skipping auto-sync`, {
+        workDir,
+        sample: statusLines.slice(0, 5),
+      });
+      return;
+    }
+
+    const divergence = await this.getBranchDivergence(workDir, branchName);
+    if (!divergence) {
+      return;
+    }
+
+    if (divergence.behind > 0 && divergence.ahead === 0) {
+      try {
+        const mergeResult = await runGit(workDir, ['merge', '--ff-only', `origin/${branchName}`], { allowFailure: true });
+        if (mergeResult.exitCode !== 0) {
+          logger.warn(`Failed to fast-forward ${label}`, { workDir, branchName });
+        }
+      } catch (err) {
+        logger.warn(`Failed to fast-forward ${label}`, { workDir, branchName, err });
+      }
+      return;
+    }
+
+    if (divergence.ahead > 0 && divergence.behind > 0) {
+      logger.warn(`Branch ${label} diverged from origin; skipping auto-sync`, {
+        workDir,
+        ahead: divergence.ahead,
+        behind: divergence.behind,
+      });
+      return;
+    }
+
+    if (divergence.ahead > 0) {
+      logger.info(`Branch ${label} has local commits; leaving as-is`, {
+        workDir,
+        ahead: divergence.ahead,
+      });
+    }
+  }
+
+  private async buildPreMergePrompt(workDir: string): Promise<string> {
+    const statusLines = await this.getWorktreeStatus(workDir);
+    const conflicts = await this.getWorktreeConflicts(workDir);
+    const notes: string[] = [];
+
+    if (statusLines.length > 0) {
+      const preview = statusLines.slice(0, 5).join(', ');
+      const suffix = statusLines.length > 5 ? ` (and ${statusLines.length - 5} more)` : '';
+      notes.push(`Detected uncommitted changes: ${preview}${suffix}`);
+    }
+
+    if (conflicts.length > 0) {
+      const preview = conflicts.slice(0, 5).join(', ');
+      const suffix = conflicts.length > 5 ? ` (and ${conflicts.length - 5} more)` : '';
+      notes.push(`Detected merge conflicts: ${preview}${suffix}`);
+    }
+
+    const noteBlock = notes.length > 0
+      ? `\nNotes from orchestrator:\n- ${notes.join('\n- ')}`
+      : '';
+
+    return `
+Pre-merge safety (must be clean):
+- git status --porcelain
+- git diff --name-only --diff-filter=U
+- If dirty: git stash push -u -m "pre-merge cleanup" (or commit)
+- If conflicts: resolve them before merging new branches.
+- Prefer targeted git add (docs/task lists). Avoid git add -A in repo root.
+- Do not force push. If push is rejected, stop and report.${noteBlock}
+    `.trim();
+  }
+
   private initializeTeams(): void {
     const workerIds = Array.from({ length: this.config.workerCount }, (_, idx) => idx + 1);
     const maxTeamSize = this.config.engineerManagerGroupSize;
@@ -769,27 +956,24 @@ Continue working autonomously. NEVER ask questions.
       }
 
       if (existsSync(team.worktreePath)) {
-        await execa('git', ['-C', team.worktreePath, 'fetch', 'origin'], { reject: false });
-        // Check if the EM team branch exists on origin, if so reset to it; otherwise stay on current
-        const { exitCode } = await execa('git', ['-C', team.worktreePath, 'rev-parse', '--verify', `origin/${team.branchName}`], { reject: false });
-        if (exitCode === 0) {
-          // EM branch exists on origin - reset to it (preserves EM's pushed work)
-          await execa('git', ['-C', team.worktreePath, 'reset', '--hard', `origin/${team.branchName}`], { reject: false });
-        }
+        await this.syncBranchToOrigin(team.worktreePath, team.branchName, `em-${team.id}`);
         // If EM branch doesn't exist on origin, leave worktree as-is to preserve local work
         await this.copyEnvFiles(this.workspaceDir, team.worktreePath);
       } else {
-        await execa('git', ['-C', this.workspaceDir, 'branch', team.branchName], { reject: false });
-        await execa('git', ['-C', this.workspaceDir, 'worktree', 'add', team.worktreePath, team.branchName]);
+        try {
+          await runGit(this.workspaceDir, ['branch', team.branchName], { allowFailure: true });
+        } catch (err) {
+          logger.warn(`Failed to create branch ${team.branchName}`, err);
+        }
+        await runGit(this.workspaceDir, ['worktree', 'add', team.worktreePath, team.branchName], { timeoutMs: 20000 });
         await this.copyEnvFiles(this.workspaceDir, team.worktreePath);
       }
     }
   }
 
-  private async ensureClaudeIgnored(workDir: string): Promise<void> {
+  private async ensureGitExcludes(workDir: string, entries: string[]): Promise<void> {
     try {
-      const { stdout } = await execa('git', ['-C', workDir, 'rev-parse', '--absolute-git-dir']);
-      const gitDir = stdout.trim();
+      const gitDir = await getGitDir(workDir);
       if (!gitDir) {
         return;
       }
@@ -805,17 +989,38 @@ Continue working autonomously. NEVER ask questions.
         existing = '';
       }
 
-      if (existing.includes('.claude/')) {
+      const existingLines = new Set(
+        existing
+          .split('\n')
+          .map(line => line.trim())
+          .filter(Boolean)
+      );
+
+      const toAdd = entries
+        .map(entry => entry.trim())
+        .filter(entry => entry.length > 0 && !existingLines.has(entry));
+
+      if (toAdd.length === 0) {
         return;
       }
 
       const needsNewline = existing.length > 0 && !existing.endsWith('\n');
       const prefix = needsNewline ? '\n' : '';
-      await appendFile(excludePath, `${prefix}.claude/\n`);
-      logger.debug('Added .claude/ to git exclude', { workDir });
+      await appendFile(excludePath, `${prefix}${toAdd.join('\n')}\n`);
+      logger.debug('Updated git exclude entries', { workDir, added: toAdd });
     } catch (err) {
-      logger.warn('Failed to ensure .claude/ is ignored', { workDir, err });
+      logger.warn('Failed to update git exclude entries', { workDir, err });
     }
+  }
+
+  private async ensureClaudeIgnored(workDir: string): Promise<void> {
+    await this.ensureGitExcludes(workDir, [
+      '.claude/',
+      'node_modules/',
+      'dist/',
+      '.vite/',
+      'worktrees/',
+    ]);
   }
 
   private async createInstances(resumeMode: boolean = false): Promise<void> {
@@ -914,6 +1119,7 @@ Continue working autonomously. NEVER ask questions.
       apiKey: authConfig?.name, // Store auth config name for reference
       model: this.config.model, // Store model for restarts
       logFile: sessionLogPath ?? undefined,
+      sessionEnv: env,
     };
 
     this.instanceManager.addInstance(instance);
@@ -1279,13 +1485,14 @@ Start now: pull ${this.config.branch}, read PROJECT_DIRECTION.md, draft EM_${tea
   1. Follow directives from ${teamLabel} via WORKER_${workerId}_TASK_LIST.md.
   2. Stay in your worktree; never touch other teams' directories.
   3. Keep commits tight and descriptive.
-  4. STOP after pushing and wait for your EM.
+  4. Never force push. If push is rejected, stop and report.
+  5. STOP after pushing and wait for your EM.
 
   ## Workflow
   1. Sync: git fetch origin && git pull origin worker-${workerId} --rebase 2>/dev/null || true
   2. Read WORKER_${workerId}_TASK_LIST.md (maintained by ${teamLabel}).
   3. Execute the current task fully.
-  4. git add -A && git commit -m "Complete: <task>" && git push origin worker-${workerId} --force.
+  4. git add -A && git commit -m "Complete: <task>" && git push origin worker-${workerId}.
 
   When you stop, your EM will merge and the Director will handle escalations.
      `.trim();
@@ -1392,8 +1599,11 @@ Start now: pull ${this.config.branch}, read PROJECT_DIRECTION.md, draft EM_${tea
       return;
     }
 
+    const preMerge = await this.buildPreMergePrompt(team.worktreePath);
     const prompt = `
 You are **Engineering Manager ${teamId} (EM-${teamId})**.
+
+${preMerge}
 
 Worker ${workerId} finished a task. Merge their branch into ${team.branchName}:
 
@@ -1432,8 +1642,11 @@ Worker ${workerId} finished a task. Merge their branch into ${team.branchName}:
       return;
     }
 
+    const preMerge = await this.buildPreMergePrompt(this.workspaceDir);
     const prompt = `
 You are the **Director**. EM-${teamId} has escalated their branch ${team.branchName}.
+
+${preMerge}
 
 1. Sync main:
    git fetch origin
@@ -1606,8 +1819,9 @@ Your previous task was merged. Time to work on your next task.
    \`\`\`bash
    git add -A
    git commit -m "Complete: <task description>"
-   git push origin worker-${workerId} --force
+   git push origin worker-${workerId}
    \`\`\`
+   If push is rejected, do NOT force push. Stop and report.
 
 5. **STOP after pushing**
 
@@ -1624,6 +1838,7 @@ Start now: Sync and read your task list.
       return;
     }
 
+    const preMerge = await this.buildPreMergePrompt(this.workspaceDir);
     const prompt = `
   ## Worker ${workerId} Completed
 
@@ -1642,6 +1857,8 @@ Start now: Sync and read your task list.
     pwd  # Must show: ${this.workspaceDir}
     git status --short  # Must show: On branch ${this.config.branch}
     \`\`\`
+
+  ${preMerge}
 
   1. **Fetch and review**:
     \`\`\`bash
@@ -1772,12 +1989,37 @@ Start now: Sync and read your task list.
   private async checkQueueHealth(): Promise<void> {
     const STUCK_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
     const warnings: string[] = [];
+    const stalled: Array<{
+      scope: string;
+      id: number;
+      ageMs: number;
+      attemptCount: number;
+      lastAttemptAt?: number;
+      lastError?: string;
+      status?: QueueItem['status'];
+    }> = [];
+
+    const queuesReport: {
+      director?: { size: number; items: ReturnType<MergeQueue['getQueueItems']> };
+      manager?: { size: number; items: ReturnType<MergeQueue['getQueueItems']> };
+      teams: Array<{ teamId: number; branch: string; size: number; items: ReturnType<MergeQueue['getQueueItems']> }>;
+    } = { teams: [] };
 
     // Check director queue
     if (this.directorMergeQueue) {
       const items = this.directorMergeQueue.getQueueItems();
+      queuesReport.director = { size: this.directorMergeQueue.size(), items };
       for (const item of items) {
         if (item.ageMs > STUCK_THRESHOLD_MS) {
+          stalled.push({
+            scope: 'director',
+            id: item.id,
+            ageMs: item.ageMs,
+            attemptCount: item.attemptCount,
+            lastAttemptAt: item.lastAttemptAt,
+            lastError: item.lastError,
+            status: item.status,
+          });
           warnings.push(
             `Director queue: Team-${item.id} stuck for ${(item.ageMs / 60000).toFixed(1)} minutes ` +
             `(${item.attemptCount} attempts)`
@@ -1789,8 +2031,18 @@ Start now: Sync and read your task list.
     // Check manager queue (non-hierarchy mode)
     if (this.managerMergeQueue) {
       const items = this.managerMergeQueue.getQueueItems();
+      queuesReport.manager = { size: this.managerMergeQueue.size(), items };
       for (const item of items) {
         if (item.ageMs > STUCK_THRESHOLD_MS) {
+          stalled.push({
+            scope: 'manager',
+            id: item.id,
+            ageMs: item.ageMs,
+            attemptCount: item.attemptCount,
+            lastAttemptAt: item.lastAttemptAt,
+            lastError: item.lastError,
+            status: item.status,
+          });
           warnings.push(
             `Manager queue: Worker-${item.id} stuck for ${(item.ageMs / 60000).toFixed(1)} minutes ` +
             `(${item.attemptCount} attempts)`
@@ -1802,8 +2054,23 @@ Start now: Sync and read your task list.
     // Check team queues
     for (const team of this.teams) {
       const items = team.mergeQueue.getQueueItems();
+      queuesReport.teams.push({
+        teamId: team.id,
+        branch: team.branchName,
+        size: team.mergeQueue.size(),
+        items,
+      });
       for (const item of items) {
         if (item.ageMs > STUCK_THRESHOLD_MS) {
+          stalled.push({
+            scope: `team-${team.id}`,
+            id: item.id,
+            ageMs: item.ageMs,
+            attemptCount: item.attemptCount,
+            lastAttemptAt: item.lastAttemptAt,
+            lastError: item.lastError,
+            status: item.status,
+          });
           warnings.push(
             `Team-${team.id} queue: Worker-${item.id} stuck for ${(item.ageMs / 60000).toFixed(1)} minutes ` +
             `(${item.attemptCount} attempts)`
@@ -1812,12 +2079,54 @@ Start now: Sync and read your task list.
       }
     }
 
+    const conflicts = await this.collectConflictState();
+    await this.writeQueueHealthReport({
+      generatedAt: new Date().toISOString(),
+      stuckThresholdMs: STUCK_THRESHOLD_MS,
+      queues: queuesReport,
+      stalled,
+      conflicts,
+    });
+
     // Log all warnings
     if (warnings.length > 0) {
       logger.warn('Queue health issues detected:');
       for (const warning of warnings) {
         logger.warn(`  - ${warning}`);
       }
+    }
+  }
+
+  private async collectConflictState(): Promise<Array<{ worktree: string; files: string[] }>> {
+    const targets: Array<{ label: string; path: string }> = [];
+    targets.push({ label: 'workspace', path: this.workspaceDir });
+    for (const team of this.teams) {
+      targets.push({ label: `em-${team.id}`, path: team.worktreePath });
+    }
+
+    const conflicts: Array<{ worktree: string; files: string[] }> = [];
+    for (const target of targets) {
+      if (!existsSync(target.path)) {
+        continue;
+      }
+      const files = await this.getWorktreeConflicts(target.path);
+      if (files.length > 0) {
+        conflicts.push({ worktree: target.label, files });
+      }
+    }
+
+    return conflicts;
+  }
+
+  private async writeQueueHealthReport(report: unknown): Promise<void> {
+    if (!this.runLogDir) {
+      return;
+    }
+    try {
+      const reportPath = join(this.runLogDir, 'queue-health.json');
+      await writeFile(reportPath, JSON.stringify(report, null, 2), 'utf-8');
+    } catch (err) {
+      logger.warn('Failed to write queue health report', err);
     }
   }
 

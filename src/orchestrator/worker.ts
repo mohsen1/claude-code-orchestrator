@@ -44,6 +44,7 @@ git add -A
 git commit -m "Complete: <brief description of what you did>"
 git push origin ${branchName}
 \`\`\`
+Do not force push. If push is rejected, stop and report.
 
 ### 4. IMPORTANT: Stop After Pushing
 After pushing your changes, **STOP and wait**. The Manager will:
@@ -128,6 +129,7 @@ ${taskDescription}
 1. Complete this task
 2. Commit your changes with a descriptive message
 3. Push to your branch: \`git push origin worker-${workerId}\`
+   Do not force push. If push is rejected, stop and report.
 4. Stop and wait for the Manager to merge your work
     `.trim();
 
@@ -164,6 +166,7 @@ ${reason}
 1. Stop your current work
 2. Commit any changes so far: \`git commit -m "WIP: interrupted - ${reason}"\`
 3. Push your branch: \`git push origin worker-${workerId}\`
+   Do not force push. If push is rejected, stop and report.
 4. Wait for new instructions
 
 The Manager will provide new directions shortly.

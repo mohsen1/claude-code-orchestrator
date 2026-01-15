@@ -220,6 +220,15 @@ async function createTestBranch(): Promise<string> {
     };
     await writeFile(join(tmpDir, 'package.json'), JSON.stringify(packageJson, null, 2));
 
+    const gitignore = [
+      'node_modules/',
+      'dist/',
+      'worktrees/',
+      '.claude/',
+      '.vite/',
+    ].join('\n') + '\n';
+    await writeFile(join(tmpDir, '.gitignore'), gitignore);
+
     // Create tsconfig.json
     const tsconfig = {
       compilerOptions: {

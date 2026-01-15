@@ -134,8 +134,9 @@ ${conflicts.map((f) => `- \`${f}\``).join('\n')}
    git fetch origin main
    git rebase origin/main
    # Resolve conflicts locally
-   git push --force-with-lease
+   git push origin ${sourceBranch}
    \`\`\`
+   If push is rejected, do NOT force push. Report back for guidance.
     `.trim();
   }
 

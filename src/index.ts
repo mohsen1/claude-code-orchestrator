@@ -102,7 +102,7 @@ async function main(): Promise<void> {
   }
 
   // Create orchestrator
-  const orchestrator = new Orchestrator(config, workspaceDir, authConfigs, runLogDir);
+  const orchestrator = new Orchestrator(config, workspaceDir, authConfigs, runLogDir, values.config);
 
   // Set up signal handlers for graceful shutdown
   setupSignalHandlers(orchestrator);

@@ -285,7 +285,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
   }
 
   // Create and start orchestrator
-  const orchestrator = new Orchestrator(config, workspaceDir, authConfigs, runLogDir);
+  const orchestrator = new Orchestrator(config, workspaceDir, authConfigs, runLogDir, configDir);
   setupSignalHandlers(orchestrator);
 
   try {

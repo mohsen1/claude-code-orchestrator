@@ -1,4 +1,4 @@
-# Claude Code Orchestrator
+# `cco` Claude Code Orchestrator
 
 A distributed system for orchestrating multiple Claude Code instances to work collaboratively on software projects.
 
@@ -11,7 +11,7 @@ The orchestrator spawns multiple Claude Code instances that work in parallel on 
 - **Engineering Managers (EMs)**: Command teams of workers, curate team branches, and maintain task lists.
 - **Workers**: Operate in isolated **git worktrees**, complete specific tasks, and push to worker-specific branches.
 
-## ✨ Features
+## Features
 
 - **Hierarchical Coordination**: Scalable Director/EM/Worker event-driven architecture.
 - **Isolation**: Git worktree isolation ensures parallel development without file conflicts.
@@ -21,7 +21,7 @@ The orchestrator spawns multiple Claude Code instances that work in parallel on 
 
 ---
 
-## 🚦 Quick Start
+## Quick Start
 
 ### 1. Requirements
 - Node.js 22+

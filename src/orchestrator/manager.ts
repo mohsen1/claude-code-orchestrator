@@ -20,6 +20,7 @@ import { clearStaleGitLocks, getGitDir, runGit } from '../git/safety.js';
 import { CostTracker, CostLimits } from './cost-tracker.js';
 import { StuckDetector } from './stuck-detector.js';
 import { generateClaudeSettings } from '../claude/hooks.js';
+import { extractRepoName } from '../utils/repo.js';
 import { execa } from 'execa';
 import { mkdir, rm, copyFile, writeFile, readFile, appendFile } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -325,6 +326,7 @@ export class Orchestrator {
   private isShuttingDown = false;
   private workspaceDir: string;
   private startTimestamp: Date | null = null;
+  private repoName: string;
 
   // Auth configs for rotation (OAuth is used by default when no config is set)
   private authConfigs: AuthConfig[] = [];
@@ -355,6 +357,7 @@ export class Orchestrator {
     this.workspaceDir = workspaceDir;
     this.authConfigs = authConfigs;
     this.runLogDir = runLogDir ?? null;
+    this.repoName = extractRepoName(this.config.repositoryUrl);
     this.validateAuthMode();
     this.authRotationPool = this.buildAuthRotationPool();
     this.authRotationIndex = 0;
@@ -1338,7 +1341,8 @@ When resolved, STOP.
     authConfig?: AuthConfig,
     resumeMode: boolean = false
   ): Promise<ClaudeInstance> {
-    const sessionName = `claude-${id}`;
+    // Use repo-prefixed session names for multi-orchestration support
+    const sessionName = `${this.repoName}-${id}`;
     const sessionLogPath = this.getSessionLogPath(id);
 
     // Build environment variables

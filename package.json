@@ -4,14 +4,14 @@
   "description": "A distributed system for orchestrating multiple Claude Code instances",
   "main": "dist/index.js",
   "bin": {
-    "cco": "dist/index.js"
+    "cco": "dist/cli/index.js"
   },
   "type": "module",
   "scripts": {
     "build": "tsc",
     "prestart": "npm run build",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
+    "start": "node dist/cli/index.js",
+    "dev": "tsx src/cli/index.ts",
     "test": "vitest run",
     "test:run": "vitest run",
     "test:e2e": "tsx tests/e2e/run-e2e.ts",

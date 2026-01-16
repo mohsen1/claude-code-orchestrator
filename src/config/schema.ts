@@ -90,6 +90,7 @@ export type OrchestratorConfig = z.infer<typeof OrchestratorConfigSchema>;
 export const AuthConfigSchema = z.object({
   name: z.string().optional(),
   apiKey: z.string().optional(),
+  envOverrides: z.record(z.string(), z.string()).optional(),
 });
 
 export type AuthConfig = z.infer<typeof AuthConfigSchema>;

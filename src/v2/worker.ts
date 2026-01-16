@@ -150,6 +150,11 @@ export class WorkerExecutor {
       env.ANTHROPIC_API_KEY = this.config.authConfig.apiKey;
     }
 
+    // Apply any environment overrides from the auth config
+    if (this.config.authConfig?.envOverrides) {
+      Object.assign(env, this.config.authConfig.envOverrides);
+    }
+
     return env;
   }
 

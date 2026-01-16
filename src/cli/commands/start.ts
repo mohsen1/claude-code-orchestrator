@@ -131,9 +131,10 @@ async function loadAuthConfigs(configDir: string): Promise<AuthConfig[]> {
         } else if (item.key) {
           // Legacy format: { name, key }
           configs.push({ name: item.name || `api-key-${configs.length + 1}`, apiKey: item.key });
-        } else if (item.env?.ANTHROPIC_API_KEY) {
-          // Legacy env format
-          configs.push({ name: item.name || `api-key-${configs.length + 1}`, apiKey: item.env.ANTHROPIC_API_KEY });
+        } else if (item.env?.ANTHROPIC_API_KEY || item.env?.ANTHROPIC_AUTH_TOKEN) {
+          // Legacy env format (supports both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN)
+          const apiKey = item.env.ANTHROPIC_API_KEY || item.env.ANTHROPIC_AUTH_TOKEN;
+          configs.push({ name: item.name || `api-key-${configs.length + 1}`, apiKey, envOverrides: item.env });
         }
       }
     }

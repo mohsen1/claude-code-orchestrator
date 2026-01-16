@@ -105,6 +105,7 @@ export interface TeamStatusInfo {
 export interface AuthConfig {
   name?: string;
   apiKey?: string;
+  envOverrides?: Record<string, string>;
 }
 
 /** V2 Orchestrator config (extends base config) */

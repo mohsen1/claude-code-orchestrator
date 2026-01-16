@@ -155,9 +155,9 @@ export class V2Orchestrator {
     const repoName = extractRepoName(this.config.repositoryUrl);
     const repoPath = join(this.config.workspaceDir, repoName);
 
-    this.git = new GitManager(repoPath);
-
     if (!existsSync(repoPath)) {
+      // Create GitManager with workspace dir (which exists) for initial clone
+      this.git = new GitManager(this.config.workspaceDir);
       await this.git.clone(
         this.config.repositoryUrl,
         this.config.branch,
@@ -165,6 +165,8 @@ export class V2Orchestrator {
         this.config.cloneDepth
       );
     } else {
+      // Repo exists, create GitManager pointed at it
+      this.git = new GitManager(repoPath);
       logger.info('Repository already exists, pulling latest', { repoPath });
       await this.git.pull('origin', this.config.branch);
     }

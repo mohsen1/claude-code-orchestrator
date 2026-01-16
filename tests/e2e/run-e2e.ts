@@ -158,12 +158,20 @@ tsconfig.json
 - Code compiles without errors
 `;
 
+interface FileDetail {
+  file: string;
+  lines: number;
+  sample: string;
+}
+
 interface TestResult {
   success: boolean;
   branchName: string;
   duration: number;
   commits: number;
   filesCreated: string[];
+  linesOfCode: number;
+  fileDetails: FileDetail[];
   workerBranches: string[];
   errors: string[];
 }
@@ -393,6 +401,8 @@ async function validateResults(branchName: string): Promise<TestResult> {
     duration: DURATION_MINUTES,
     commits: 0,
     filesCreated: [],
+    linesOfCode: 0,
+    fileDetails: [],
     workerBranches: [],
     errors: [],
   };
@@ -414,6 +424,25 @@ async function validateResults(branchName: string): Promise<TestResult> {
     const { stdout: filesOutput } = await runCommand('git', ['ls-tree', '-r', '--name-only', 'HEAD', 'src/'], { cwd: tmpDir, reject: false });
     result.filesCreated = filesOutput.trim().split('\n').filter(f => f.trim() && f !== 'src/.gitkeep');
 
+    // Verify actual code content in created files
+    let totalLinesOfCode = 0;
+    const fileContents: { file: string; lines: number; sample: string }[] = [];
+
+    for (const file of result.filesCreated) {
+      try {
+        const filePath = join(tmpDir, file);
+        const content = await readFile(filePath, 'utf-8');
+        const lines = content.split('\n').filter(l => l.trim()).length;
+        totalLinesOfCode += lines;
+
+        // Get first non-empty lines as sample
+        const sampleLines = content.split('\n').filter(l => l.trim()).slice(0, 3).join(' | ');
+        fileContents.push({ file, lines, sample: sampleLines.substring(0, 100) });
+      } catch {
+        // File doesn't exist or can't be read
+      }
+    }
+
     // Check for worker branches
     const { stdout: branchesOutput } = await runCommand('git', ['branch', '-r'], { cwd: tmpDir });
     result.workerBranches = branchesOutput
@@ -425,16 +454,25 @@ async function validateResults(branchName: string): Promise<TestResult> {
     const { stdout: taskListsOutput } = await runCommand('git', ['ls-files', 'WORKER_*_TASK_LIST.md'], { cwd: tmpDir, reject: false });
     const taskLists = taskListsOutput.trim().split('\n').filter(f => f.trim());
 
-    // Determine success
-    if (result.commits > 0) {
+    // Determine success - require actual code, not just commits
+    if (result.commits > 0 && totalLinesOfCode > 0) {
       result.success = true;
-    } else {
+    } else if (result.commits === 0) {
       result.errors.push('No commits were made');
+    } else if (totalLinesOfCode === 0) {
+      result.errors.push('No actual code written (files are empty)');
     }
 
     if (taskLists.length === 0) {
       result.errors.push('No WORKER_*_TASK_LIST.md files found');
     }
+
+    // Set code verification results
+    result.linesOfCode = totalLinesOfCode;
+    result.fileDetails = fileContents;
+
+    // Log file contents for verification
+    log('Code verification', { totalLinesOfCode, files: fileContents });
 
     log('Validation complete', result);
     return result;
@@ -505,8 +543,15 @@ async function main() {
     console.log(`Status: ${result.success ? 'PASSED' : 'FAILED'}`);
     console.log(`Branch: ${result.branchName}`);
     console.log(`Commits: ${result.commits}`);
+    console.log(`Total Lines of Code: ${result.linesOfCode}`);
     console.log(`Files Created: ${result.filesCreated.length}`);
-    result.filesCreated.forEach(f => console.log(`  - ${f}`));
+    result.fileDetails.forEach(f => console.log(`  - ${f.file} (${f.lines} lines)`));
+    if (result.fileDetails.length > 0) {
+      console.log('Code Samples:');
+      result.fileDetails.slice(0, 3).forEach(f => {
+        if (f.sample) console.log(`  ${f.file}: ${f.sample}...`);
+      });
+    }
     console.log(`Worker Branches: ${result.workerBranches.length}`);
     result.workerBranches.forEach(b => console.log(`  - ${b}`));
     if (result.errors.length > 0) {

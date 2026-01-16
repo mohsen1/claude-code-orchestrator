@@ -295,31 +295,54 @@ Instructions:
         });
       }
     } else {
-      // In hierarchy mode, create a task for the director to distribute work
+      // In hierarchy mode, create a task for the director to coordinate AND implement
       this.taskQueue.addTask({
         title: 'Director: Plan and distribute work',
-        description: `You are the Director. Read PROJECT_DIRECTION.md and create a work distribution plan.
+        description: `You are the Director. Read PROJECT_DIRECTION.md and TEAM_STRUCTURE.md to understand the project state.
 
 PROJECT_DIRECTION.md contents:
 ${projectDirection}
 
-Instructions:
-1. Analyze the project requirements
-2. Create TEAM_STRUCTURE.md with task assignments for each team
-3. Break down the project into tasks suitable for ${this.config.workerCount} workers
-4. Assign tasks to Engineering Managers who will distribute to their teams
-5. Monitor progress and handle any escalations`,
+CRITICAL INSTRUCTIONS:
+1. Check if TEAM_STRUCTURE.md exists - if not, create it with task assignments
+2. If TEAM_STRUCTURE.md already exists, REVIEW it and pick ONE unassigned Tier 0 or Tier 1 issue to FIX
+3. PRIORITIZE actual CODE CHANGES over documentation:
+   - Tier 0 fixes in wasm/src/solver/*.rs, wasm/src/thin_checker.rs
+   - Tier 1 fixes in wasm/src/thin_parser.rs
+4. When making code changes:
+   - Read the relevant .rs files first
+   - Make minimal, focused changes
+   - Test with: cd wasm && cargo build
+5. Commit your ACTUAL CODE CHANGES (not just documentation)
+6. Documentation updates are secondary - code fixes are primary`,
         priority: 'high',
       });
 
-      // Create initial tasks for EMs to check for work
+      // Create initial tasks for EMs to IMPLEMENT, not just coordinate
       const teams = this.teamManager.getAllTeams();
       for (const team of teams) {
         this.taskQueue.addTask({
           title: `EM Team ${team.id}: Check for assigned tasks`,
           description: `You are the Engineering Manager for Team ${team.id}.
-Check TEAM_STRUCTURE.md for your team's assigned tasks.
-Distribute work to your workers and ensure quality delivery.`,
+
+CRITICAL: Your job is to IMPLEMENT CODE, not just create documentation.
+
+Instructions:
+1. Read TEAM_STRUCTURE.md for your team's assigned tasks
+2. Read PROJECT_DIRECTION.md for Tier 0/1/2 issues
+3. PICK ONE specific issue to fix (prefer Tier 0 first)
+4. IMPLEMENT the fix in actual Rust code:
+   - Read the relevant .rs file
+   - Make the code change
+   - Build with: cd wasm && cargo build
+5. If build succeeds, commit the CODE change
+6. Documentation/status reports are LOW priority - code fixes are HIGH priority
+
+Key files to modify:
+- wasm/src/thin_checker.rs (type checking)
+- wasm/src/solver/*.rs (type resolution)
+- wasm/src/thin_parser.rs (parsing)
+- wasm/src/binder/*.rs (symbol binding)`,
           priority: 'normal',
         });
       }

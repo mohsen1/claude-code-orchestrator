@@ -363,6 +363,8 @@ Distribute work to your workers and ensure quality delivery.`,
    */
   private async processLoop(): Promise<void> {
     logger.info('Processing loop started');
+    let lastProgressLog = Date.now();
+    const progressLogInterval = 30000; // Log progress every 30 seconds
 
     while (this.state === 'running' || this.state === 'paused') {
       // Check for pause signal
@@ -399,6 +401,20 @@ Distribute work to your workers and ensure quality delivery.`,
 
       // Periodic git maintenance to clean up temp pack files
       await this.performGitMaintenanceIfNeeded();
+
+      // Periodic progress logging
+      if (Date.now() - lastProgressLog >= progressLogInterval) {
+        const activeWorkerIds = Array.from(this.activeTasks.keys());
+        const stats = this.taskQueue.getStats();
+        logger.info('Progress update', {
+          activeWorkers: activeWorkerIds.length,
+          activeWorkerIds,
+          tasksCompleted: stats.completed,
+          tasksPending: stats.pending,
+          tasksInProgress: stats.inProgress,
+        });
+        lastProgressLog = Date.now();
+      }
 
       // Small delay to prevent tight loop
       await this.sleep(this.config.pollIntervalMs);
@@ -450,6 +466,13 @@ Distribute work to your workers and ensure quality delivery.`,
 
     // Build and execute prompt
     const prompt = buildWorkerPrompt(worker.id, taskFileName);
+
+    logger.info(`Worker ${worker.id} executing claude --print`, {
+      workerId: worker.id,
+      taskTitle: task.title,
+      worktreePath: worker.worktreePath,
+    });
+
     const result = await executor.runTask(prompt);
 
     return result;

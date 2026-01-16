@@ -101,6 +101,11 @@ const { values } = parseArgs({
       default: 'haiku',
       description: 'Claude model to use (haiku, sonnet, opus)',
     },
+    'em-group-size': {
+      type: 'string',
+      short: 'g',
+      description: 'Engineer manager group size (controls flat vs hierarchy mode)',
+    },
     cleanup: {
       type: 'boolean',
       default: true,
@@ -111,6 +116,7 @@ const { values } = parseArgs({
 const TEST_REPO = values.repo!;
 const DURATION_MINUTES = parseInt(values.duration!, 10);
 const WORKER_COUNT = parseInt(values.workers!, 10);
+const EM_GROUP_SIZE = values['em-group-size'] ? parseInt(values['em-group-size'], 10) : undefined;
 const AUTH_CONFIG_PATH = values['auth-config'];
 const MODEL = values.model!;
 const TIMING_BASE_MS = 30000;
@@ -271,7 +277,10 @@ async function createTestConfig(branchName: string): Promise<string> {
   const configDir = `/tmp/e2e-config-${Date.now()}`;
   await mkdir(configDir, { recursive: true });
 
-  const engineerManagerGroupSize = Math.min(8, Math.max(1, WORKER_COUNT - 1));
+  // If em-group-size is specified, use it; otherwise default to workerCount-1 (hierarchy mode)
+  // To test flat mode: set em-group-size >= workerCount
+  const engineerManagerGroupSize = EM_GROUP_SIZE ?? Math.min(8, Math.max(1, WORKER_COUNT - 1));
+  const mode = WORKER_COUNT <= engineerManagerGroupSize ? 'flat' : 'hierarchy';
   const serverPort = 20000 + Math.floor(Math.random() * 30000);
 
   const config = {
@@ -294,7 +303,7 @@ async function createTestConfig(branchName: string): Promise<string> {
     log('Auth config copied');
   }
 
-  log('Test config created', config);
+  log(`Test config created (mode: ${mode})`, config);
   return configDir;
 }
 
@@ -449,12 +458,17 @@ async function cleanup(configDir: string, workspaceDir: string): Promise<void> {
 }
 
 async function main() {
+  const effectiveGroupSize = EM_GROUP_SIZE ?? Math.min(8, Math.max(1, WORKER_COUNT - 1));
+  const mode = WORKER_COUNT <= effectiveGroupSize ? 'FLAT' : 'HIERARCHY';
+
   console.log('='.repeat(60));
   console.log('Claude Code Orchestrator - E2E Test');
   console.log('='.repeat(60));
   console.log(`Repo: ${TEST_REPO}`);
   console.log(`Duration: ${DURATION_MINUTES} minutes`);
   console.log(`Workers: ${WORKER_COUNT}`);
+  console.log(`EM Group Size: ${effectiveGroupSize}`);
+  console.log(`Mode: ${mode}`);
   console.log(`Model: ${MODEL}`);
   console.log(`Timing base: ${TIMING_BASE_MS} ms`);
   console.log('='.repeat(60));

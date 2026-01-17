@@ -1,24 +1,46 @@
 /**
- * Claude Code Orchestrator (V3)
+ * V3 Orchestrator - Agent SDK Based
  *
- * Main module export - re-exports the V3 orchestrator built on the Claude Agent SDK.
- * For CLI usage, run via `cco` command or `npm start`.
- *
+ * This module exports the v3 architecture built on the Claude Agent SDK.
  * The key innovation is session continuity - workers maintain context across
  * multiple tasks using the SDK's resume capability.
+ *
+ * ## Usage
+ *
+ * ```typescript
+ * import { OrchestratorV3, createOrchestratorFromConfig } from './v3';
+ *
+ * // Create from config file (v2-compatible)
+ * const orchestrator = await createOrchestratorFromConfig(
+ *   './orchestrator.json',
+ *   './workspace'
+ * );
+ *
+ * // Or create directly
+ * const orchestrator = new OrchestratorV3({
+ *   repositoryUrl: 'git@github.com:user/repo.git',
+ *   branch: 'main',
+ *   workspaceDir: './workspace',
+ *   projectDirection: '...',
+ *   workerCount: 4,
+ * });
+ *
+ * // Start orchestration
+ * await orchestrator.start();
+ *
+ * // Later: continue with new instructions (session continuity!)
+ * await orchestrator.continue('Now add authentication to all endpoints');
+ * ```
  */
 
-// Re-export V3 orchestrator and all components
+// Core orchestrator
+export { OrchestratorV3, createOrchestratorFromConfig } from './orchestrator.js';
+
+// Session management
+export { SessionManager, type SessionManagerConfig } from './session-manager.js';
+
+// Agent definitions
 export {
-  // Core orchestrator
-  OrchestratorV3,
-  createOrchestratorFromConfig,
-
-  // Session management
-  SessionManager,
-  type SessionManagerConfig,
-
-  // Agent definitions
   createWorkerAgent,
   createEngineeringManagerAgent,
   createDirectorAgent,
@@ -27,8 +49,10 @@ export {
   createLeadAgent,
   TOOL_SETS,
   type AgentDefinition,
+} from './agents.js';
 
-  // Hooks
+// Hooks
+export {
   createGitSafetyHooks,
   createAuditHooks,
   createFileTrackingHooks,
@@ -43,9 +67,9 @@ export {
   type HookResult,
   type HookMatcher,
   type HooksConfig,
-} from './v3/index.js';
+} from './hooks.js';
 
-// Re-export types
+// Types
 export type {
   // Configuration
   V3OrchestratorConfig,
@@ -85,13 +109,4 @@ export type {
 
   // Auth
   AuthConfig,
-} from './v3/index.js';
-
-// Re-export config
-export { OrchestratorConfigSchema } from './config/schema.js';
-export type { OrchestratorConfig } from './config/schema.js';
-
-// Re-export utilities
-export { logger, configureLogDirectory } from './utils/logger.js';
-export { extractRepoName } from './utils/repo.js';
-export { GitManager } from './git/worktree.js';
+} from './types.js';

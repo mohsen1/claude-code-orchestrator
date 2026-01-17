@@ -1,15 +1,14 @@
 #!/usr/bin/env npx tsx
 /**
- * End-to-End Test for Claude Code Orchestrator
+ * End-to-End Test for Claude Code Orchestrator (V3 - Agent SDK)
  *
- * This test validates the complete orchestration workflow by running real Claude
- * instances against a test repository. It verifies that:
+ * This test validates the complete orchestration workflow using the Claude Agent SDK.
+ * It verifies that:
  *
- * - Manager and worker instances start correctly
+ * - Coordinator/Director sessions start correctly
  * - Workers receive and complete tasks from PROJECT_DIRECTION.md
  * - Workers commit and push changes to their branches
- * - Merge queue processes worker branches correctly
- * - Manager heartbeat keeps the system active
+ * - Session continuity works via SDK resume
  * - Graceful shutdown works properly
  *
  * ## Test Flow
@@ -17,7 +16,7 @@
  * 1. Creates a unique test branch (e2e-{timestamp}) in the test repo
  * 2. Sets up a simple calculator project with PROJECT_DIRECTION.md
  * 3. Starts the orchestrator with configured workers
- * 4. Runs for the specified duration while Claude instances work
+ * 4. Runs for the specified duration while Claude sessions work
  * 5. Validates results (commits, files created, worker branches)
  * 6. Reports success/failure with detailed metrics
  *
@@ -42,20 +41,19 @@
  *   -w, --workers <count>     Number of workers (default: 2)
  *   -m, --model <model>       Claude model: haiku, sonnet, opus (default: haiku)
  *   -a, --auth-config <path>  Path to api-keys.json for API key auth
- *   --no-cleanup              Don't clean up tmux sessions after test
+ *   --no-cleanup              Don't clean up workspace after test
  *
  * ## Requirements
  *
  *   - Git configured with SSH push access to the test repo
  *   - Claude Code CLI installed (`claude` command available)
  *   - Valid authentication (OAuth via ~/.claude or API keys via api-keys.json)
- *   - tmux installed (for running Claude instances)
  *
  * ## Success Criteria
  *
  * The test passes if:
  *   - At least one commit was made to the test branch
- *   - WORKER_*_TASK_LIST.md files were created (indicates task distribution)
+ *   - Actual code was written (non-empty files in src/)
  *
  * ## Viewing Results
  *
@@ -63,7 +61,6 @@
  *   - Commits made by workers
  *   - Files created (src/*.ts)
  *   - Worker branches (worker-1, worker-2, etc.)
- *   - Task list files showing work distribution
  */
 
 import { execa } from 'execa';
@@ -325,7 +322,7 @@ async function runOrchestrator(
   const hardExitBufferMs = timingBaseMs;
   log(`Starting orchestrator for ${durationMs / 60000} minutes (grace: ${graceMs / 1000}s)...`);
 
-  const orchestratorPath = join(process.cwd(), 'dist', 'index.js');
+  const orchestratorPath = join(process.cwd(), 'dist', 'cli', 'index.js');
 
   return new Promise((resolve) => {
     let stdout = '';
@@ -450,10 +447,6 @@ async function validateResults(branchName: string): Promise<TestResult> {
       .map(b => b.trim())
       .filter(b => b.includes('worker-'));
 
-    // Check for WORKER_*_TASK_LIST.md files
-    const { stdout: taskListsOutput } = await runCommand('git', ['ls-files', 'WORKER_*_TASK_LIST.md'], { cwd: tmpDir, reject: false });
-    const taskLists = taskListsOutput.trim().split('\n').filter(f => f.trim());
-
     // Determine success - require actual code, not just commits
     if (result.commits > 0 && totalLinesOfCode > 0) {
       result.success = true;
@@ -461,10 +454,6 @@ async function validateResults(branchName: string): Promise<TestResult> {
       result.errors.push('No commits were made');
     } else if (totalLinesOfCode === 0) {
       result.errors.push('No actual code written (files are empty)');
-    }
-
-    if (taskLists.length === 0) {
-      result.errors.push('No WORKER_*_TASK_LIST.md files found');
     }
 
     // Set code verification results
@@ -485,9 +474,6 @@ async function cleanup(configDir: string, workspaceDir: string): Promise<void> {
   if (values.cleanup) {
     log('Cleaning up...');
     await rm(configDir, { recursive: true, force: true });
-
-    // Kill any orphaned tmux sessions
-    await runCommand('bash', ['-c', "tmux list-sessions 2>/dev/null | grep '^claude-' | cut -d: -f1 | xargs -I{} tmux kill-session -t {} 2>/dev/null || true"]);
 
     if (workspaceDir) {
       await rm(workspaceDir, { recursive: true, force: true }).catch(() => {});

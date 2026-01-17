@@ -22,6 +22,7 @@ export const OrchestratorConfigSchema = z
     // Workspace settings
     workspaceDir: z.string().min(1).optional(), // Path to the workspace directory
     logDirectory: z.string().min(1).optional(),
+    localRepoPath: z.string().min(1).optional(), // Path to local repo to copy from (faster than cloning)
 
     // Worker settings
     workerCount: z.number().int().min(1).max(20),
@@ -69,6 +70,7 @@ export const OrchestratorConfigSchema = z
       useRunBranch: config.useRunBranch,
       workspaceDir: config.workspaceDir,
       logDirectory: config.logDirectory,
+      localRepoPath: config.localRepoPath,
       workerCount: config.workerCount,
       engineerManagerGroupSize: config.engineerManagerGroupSize,
       model: config.model,

@@ -4,8 +4,8 @@ import { join, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
-import { V2Orchestrator } from '../../v2/index.js';
-import type { AuthConfig, V2OrchestratorConfig } from '../../v2/types.js';
+import { OrchestratorV3 } from '../../v3/index.js';
+import type { V3OrchestratorConfig, AuthConfig } from '../../v3/types.js';
 import { ConfigLoader } from '../../config/loader.js';
 import { logger, configureLogDirectory } from '../../utils/logger.js';
 import { extractRepoName } from '../../utils/repo.js';
@@ -19,7 +19,7 @@ interface StartOptions {
  * Interactive prompts for configuration
  */
 async function runInteractiveSetup(): Promise<{ configDir: string; workspaceDir: string }> {
-  console.log(chalk.cyan('\n🚀 Claude Code Orchestrator (V2) - Interactive Setup\n'));
+  console.log(chalk.cyan('\n Claude Code Orchestrator - Interactive Setup\n'));
 
   const answers = await inquirer.prompt([
     {
@@ -80,7 +80,7 @@ async function runInteractiveSetup(): Promise<{ configDir: string; workspaceDir:
 
   await writeFile(join(configDir, 'orchestrator.json'), JSON.stringify(config, null, 2));
 
-  console.log(chalk.green(`\n✓ Config created at: ${configDir}`));
+  console.log(chalk.green(`\n Config created at: ${configDir}`));
   console.log(chalk.gray(`  Workspace will be at: ${workspaceDir}\n`));
 
   // If api-keys-only, prompt for API key
@@ -97,7 +97,7 @@ async function runInteractiveSetup(): Promise<{ configDir: string; workspaceDir:
 
     const apiKeys = [{ name: 'api-key-1', apiKey: keyAnswer.apiKey }];
     await writeFile(join(configDir, 'api-keys.json'), JSON.stringify(apiKeys, null, 2));
-    console.log(chalk.green('✓ API key saved'));
+    console.log(chalk.green(' API key saved'));
   }
 
   return { configDir, workspaceDir };
@@ -108,33 +108,30 @@ async function runInteractiveSetup(): Promise<{ configDir: string; workspaceDir:
  */
 async function loadAuthConfigs(configDir: string): Promise<AuthConfig[]> {
   const configPath = join(configDir, 'api-keys.json');
-  const legacyPath = join(configDir, 'auth-configs.json');
-  const finalPath = existsSync(configPath) ? configPath : legacyPath;
 
-  if (!existsSync(finalPath)) {
+  if (!existsSync(configPath)) {
     return [];
   }
 
   try {
-    const content = await readFile(finalPath, 'utf-8');
+    const content = await readFile(configPath, 'utf-8');
     const data = JSON.parse(content);
     const configs: AuthConfig[] = [];
 
     if (Array.isArray(data)) {
       for (const item of data) {
         if (typeof item === 'string') {
-          // Plain API key string
+          // Simple string API key
           configs.push({ name: `api-key-${configs.length + 1}`, apiKey: item });
         } else if (item.apiKey) {
-          // V2 format: { name, apiKey }
+          // Object with apiKey field
           configs.push({ name: item.name || `api-key-${configs.length + 1}`, apiKey: item.apiKey });
-        } else if (item.key) {
-          // Legacy format: { name, key }
-          configs.push({ name: item.name || `api-key-${configs.length + 1}`, apiKey: item.key });
-        } else if (item.env?.ANTHROPIC_API_KEY || item.env?.ANTHROPIC_AUTH_TOKEN) {
-          // Legacy env format (supports both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN)
-          const apiKey = item.env.ANTHROPIC_API_KEY || item.env.ANTHROPIC_AUTH_TOKEN;
-          configs.push({ name: item.name || `api-key-${configs.length + 1}`, apiKey, envOverrides: item.env });
+        } else if (item.env) {
+          // Env-based config (e.g., z.ai format)
+          configs.push({
+            name: item.name || `api-key-${configs.length + 1}`,
+            env: item.env,
+          });
         }
       }
     }
@@ -178,7 +175,7 @@ async function createRunLogDirectory(baseDir: string): Promise<string> {
 /**
  * Set up signal handlers for graceful shutdown
  */
-function setupSignalHandlers(orchestrator: V2Orchestrator): void {
+function setupSignalHandlers(orchestrator: OrchestratorV3): void {
   let isShuttingDown = false;
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -191,7 +188,7 @@ function setupSignalHandlers(orchestrator: V2Orchestrator): void {
     logger.info(`Received ${signal}, initiating graceful shutdown...`);
 
     try {
-      await orchestrator.shutdown();
+      await orchestrator.stop(signal);
       process.exit(0);
     } catch (err) {
       logger.error('Error during shutdown', err);
@@ -204,13 +201,13 @@ function setupSignalHandlers(orchestrator: V2Orchestrator): void {
 
   process.on('uncaughtException', async (err) => {
     logger.error('Uncaught exception', err);
-    await orchestrator.shutdown();
+    await orchestrator.stop('uncaughtException');
     process.exit(1);
   });
 
   process.on('unhandledRejection', async (reason) => {
     logger.error('Unhandled rejection', reason);
-    await orchestrator.shutdown();
+    await orchestrator.stop('unhandledRejection');
     process.exit(1);
   });
 }
@@ -255,7 +252,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
       }
     }
 
-    logger.info('Claude Code Orchestrator (V2) starting...', {
+    logger.info('Claude Code Orchestrator starting...', {
       configDir,
       workspaceDir,
       runLogDir,
@@ -267,8 +264,6 @@ export async function startCommand(options: StartOptions): Promise<void> {
       workerCount: config.workerCount,
       engineerManagerGroupSize: config.engineerManagerGroupSize,
       authMode: config.authMode,
-      taskTimeoutMs: config.taskTimeoutMs,
-      pollIntervalMs: config.pollIntervalMs,
     });
   } catch (err) {
     logger.error('Configuration error', err);
@@ -283,72 +278,77 @@ export async function startCommand(options: StartOptions): Promise<void> {
     process.exit(1);
   }
 
-  if (config.authMode === 'api-keys-first' && authConfigs.length === 0) {
-    logger.warn('authMode "api-keys-first" requested but no api-keys.json found; falling back to OAuth');
-  }
-
   if (authConfigs.length > 0) {
-    logger.info(`Loaded ${authConfigs.length} auth config(s) for rotation: ${authConfigs.map((c) => c.name).join(', ')}`);
+    logger.info(`Loaded ${authConfigs.length} auth config(s): ${authConfigs.map((c) => c.name).join(', ')}`);
   } else {
-    logger.info('No auth configs loaded - using OAuth authentication');
+    logger.info('Using OAuth authentication');
   }
 
-  // Build V2 config
-  const v2Config: V2OrchestratorConfig = {
+  // Build config
+  const v3Config: Partial<V3OrchestratorConfig> & Pick<V3OrchestratorConfig, 'repositoryUrl' | 'branch' | 'workspaceDir' | 'projectDirection'> = {
     repositoryUrl: config.repositoryUrl,
     branch: config.branch,
-    workerCount: config.workerCount,
     workspaceDir: workspaceDir!,
-    logDirectory: config.logDirectory,
-    model: config.model,
-    authMode: config.authMode,
+    localRepoPath: config.localRepoPath,
+    projectDirection: '', // Will be loaded from PROJECT_DIRECTION.md
+    workerCount: config.workerCount,
     engineerManagerGroupSize: config.engineerManagerGroupSize,
+    authMode: config.authMode || 'oauth',
     taskTimeoutMs: config.taskTimeoutMs,
     pollIntervalMs: config.pollIntervalMs,
-    maxToolUsesPerInstance: config.maxToolUsesPerInstance,
-    maxTotalToolUses: config.maxTotalToolUses,
     maxRunDurationMinutes: config.maxRunDurationMinutes,
-    envFiles: config.envFiles,
-    cloneDepth: config.cloneDepth,
-    useRunBranch: config.useRunBranch,
+    logDirectory: config.logDirectory,
+    sessionPersistPath: join(configDir, 'sessions.json'),
+    autoResume: true,
+    permissionMode: 'bypassPermissions',
+    auditLog: true,
+    progressIntervalMs: 30000,
   };
 
-  // Create pause signal path
-  const pauseSignalPath = join(configDir, 'pause.signal');
-
   // Create and start orchestrator
-  const orchestrator = new V2Orchestrator(v2Config, authConfigs, pauseSignalPath);
+  const orchestrator = new OrchestratorV3(v3Config);
   setupSignalHandlers(orchestrator);
 
+  // Forward events to logger with verbose output
+  orchestrator.on('tool:start', (event) => {
+    logger.info('Tool call', { sessionId: event.data.sessionId, tool: event.data.tool });
+  });
+
+  orchestrator.on('task:complete', (event) => {
+    logger.info('Task completed', { sessionId: event.data.sessionId, resultLength: event.data.result?.length || 0 });
+  });
+
+  orchestrator.on('task:error', (event) => {
+    logger.error('Task error', { sessionId: event.data.sessionId, error: event.data.error });
+  });
+
+  orchestrator.on('query:start', (event) => {
+    logger.info('Query started', { sessionId: event.data.sessionId });
+  });
+
+  orchestrator.on('query:message', (event) => {
+    logger.debug('Query message', { sessionId: event.data.sessionId, type: event.data.type });
+  });
+
+  orchestrator.on('text:stream', (data) => {
+    if (data?.text) {
+      process.stdout.write(data.text);
+    }
+  });
+
+  // Progress logging every 30 seconds
+  const progressInterval = setInterval(() => {
+    const status = orchestrator.getStatus?.() || {};
+    logger.info('Progress', status);
+  }, 30000);
+
   try {
-    // For now, start without tasks - tasks will be loaded from the project
-    // In a real implementation, you'd load tasks from a task file or API
     await orchestrator.start();
-
-    // Log status periodically
-    const statusIntervalMs = config.pollIntervalMs * 6; // Every 30 seconds by default
-    const statusInterval = setInterval(() => {
-      const status = orchestrator.getStatus();
-      logger.info('Orchestrator status', {
-        mode: status.mode,
-        isRunning: status.isRunning,
-        isPaused: status.isPaused,
-        totalTasks: status.totalTasks,
-        completedTasks: status.completedTasks,
-        failedTasks: status.failedTasks,
-        pendingTasks: status.pendingTasks,
-        runDurationMinutes: status.runDurationMinutes.toFixed(1),
-        workers: status.workers.map((w) => ({
-          id: w.id,
-          status: w.status,
-          task: w.currentTaskTitle || 'idle',
-        })),
-      });
-    }, statusIntervalMs);
-
-    process.on('exit', () => clearInterval(statusInterval));
+    clearInterval(progressInterval);
+    logger.info('Orchestrator completed');
   } catch (err) {
-    logger.error('Failed to start orchestrator', err);
+    clearInterval(progressInterval);
+    logger.error('Orchestrator failed', err);
     process.exit(1);
   }
 }

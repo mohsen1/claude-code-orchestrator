@@ -280,7 +280,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
       repository: config.repositoryUrl,
       branch: config.branch,
       workerCount: config.workerCount,
-      engineerManagerGroupSize: config.engineerManagerGroupSize,
+      model: config.model,
       authMode: config.authMode,
     });
   } catch (err) {
@@ -310,7 +310,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
     localRepoPath: config.localRepoPath,
     projectDirection: '', // Will be loaded from PROJECT_DIRECTION.md
     workerCount: config.workerCount,
-    engineerManagerGroupSize: config.engineerManagerGroupSize,
+    model: config.model || 'opus',
     authMode: config.authMode || 'oauth',
     taskTimeoutMs: config.taskTimeoutMs,
     pollIntervalMs: config.pollIntervalMs,
@@ -321,6 +321,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
     permissionMode: 'bypassPermissions',
     auditLog: true,
     progressIntervalMs: 30000,
+    useRunBranch: config.useRunBranch,
   };
 
   // Create and start orchestrator

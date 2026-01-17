@@ -33,7 +33,6 @@ import type {
   PersistedState,
   PersistedSession,
   ProgressStats,
-  OrchestratorMode,
 } from './types.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -84,7 +83,6 @@ export class SessionManager extends EventEmitter {
   private autoSaveTimer?: NodeJS.Timeout;
   private orchestratorId: string;
   private startedAt: Date;
-  private mode: OrchestratorMode = 'flat';
 
   constructor(config: Partial<SessionManagerConfig> = {}) {
     super();
@@ -569,11 +567,11 @@ Be comprehensive but concise.
    */
   async saveState(): Promise<void> {
     const state: PersistedState = {
-      version: 3,
+      version: 4,
       orchestratorId: this.orchestratorId,
       startedAt: this.startedAt.toISOString(),
       lastSavedAt: new Date().toISOString(),
-      mode: this.mode,
+      workerCount: this.getAllSessions().filter(s => s.role === 'worker').length,
       sessions: this.serializeSessions(),
       stats: this.getStats(),
     };
@@ -599,13 +597,12 @@ Be comprehensive but concise.
       const content = await readFile(this.config.persistPath, 'utf-8');
       const state: PersistedState = JSON.parse(content);
 
-      if (state.version !== 3) {
+      if (state.version !== 4) {
         throw new Error(`Incompatible state version: ${state.version}`);
       }
 
       this.orchestratorId = state.orchestratorId;
       this.startedAt = new Date(state.startedAt);
-      this.mode = state.mode;
       this.deserializeSessions(state.sessions);
 
       this.emit('state:loaded', {
@@ -764,13 +761,6 @@ Be comprehensive but concise.
     if (this.autoSaveTimer) {
       clearInterval(this.autoSaveTimer);
     }
-  }
-
-  /**
-   * Set the orchestrator mode (flat or hierarchy)
-   */
-  setMode(mode: OrchestratorMode): void {
-    this.mode = mode;
   }
 
   /**

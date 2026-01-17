@@ -1,32 +1,31 @@
 /**
  * Orchestrator - Agent SDK Based
  *
- * Main orchestration engine using the Claude Agent SDK with session continuity.
+ * Simplified Lead/Worker architecture:
+ * - Lead: Coordinates work, read-only access to main repo
+ * - Workers: Parallel implementers, each with own worktree
  */
 
 import { EventEmitter } from 'events';
 import { join, dirname, resolve } from 'path';
 import { existsSync } from 'fs';
-import { mkdir, readFile, writeFile, rm } from 'fs/promises';
+import { mkdir, readFile } from 'fs/promises';
 import { SessionManager, type SessionManagerConfig } from './session-manager.js';
 import {
-  createTeamAgents,
   createLeadAgent,
   createWorkerAgent,
+  createWorkerAgents,
   type AgentDefinition,
 } from './agents.js';
 import { createDefaultHooks, gitLock, type HooksConfig } from './hooks.js';
 import type {
   OrchestratorConfig,
-  OrchestratorMode,
   OrchestratorStatus,
   OrchestratorState,
   OrchestratorEvent,
   Session,
   TeamStructure,
-  EngineeringManagerTeam,
   AuthConfig,
-  ProgressStats,
 } from './types.js';
 import { logger, configureLogDirectory } from './utils/logger.js';
 
@@ -36,15 +35,9 @@ import { logger, configureLogDirectory } from './utils/logger.js';
 
 const DEFAULT_CONFIG: Partial<OrchestratorConfig> = {
   workerCount: 2,
-  engineerManagerGroupSize: 4,
-  models: {
-    director: 'opus',
-    engineeringManager: 'sonnet',
-    worker: 'sonnet',
-  },
+  model: 'opus',
   autoResume: true,
   permissionMode: 'bypassPermissions',
-  maxConcurrentWorkers: 4,
   taskTimeoutMs: 600000, // 10 minutes
   pollIntervalMs: 5000,
   maxRunDurationMinutes: 120,
@@ -61,7 +54,6 @@ export class Orchestrator extends EventEmitter {
   private config: OrchestratorConfig;
   private sessionManager: SessionManager;
   private state: OrchestratorState = 'idle';
-  private mode: OrchestratorMode = 'flat';
   private startedAt?: Date;
   private hooks: HooksConfig;
 
@@ -70,6 +62,7 @@ export class Orchestrator extends EventEmitter {
 
   // Git state
   private repoPath?: string;
+  private workBranch?: string; // Branch where workers merge to (may differ from config.branch if useRunBranch=true)
 
   // API keys
   private apiKeys: AuthConfig[] = [];
@@ -84,11 +77,6 @@ export class Orchestrator extends EventEmitter {
   constructor(config: Partial<OrchestratorConfig> & Pick<OrchestratorConfig, 'repositoryUrl' | 'branch' | 'workspaceDir' | 'projectDirection'>) {
     super();
     this.config = { ...DEFAULT_CONFIG, ...config } as OrchestratorConfig;
-
-    // Determine mode based on worker count vs EM group size
-    this.mode = this.config.workerCount > this.config.engineerManagerGroupSize
-      ? 'hierarchy'
-      : 'flat';
 
     // Configure logger directory
     configureLogDirectory(this.config.logDirectory || join(this.config.workspaceDir, 'logs'));
@@ -126,9 +114,9 @@ export class Orchestrator extends EventEmitter {
     this.startedAt = new Date();
 
     logger.info('Starting Orchestrator', {
-      mode: this.mode,
       workerCount: this.config.workerCount,
       branch: this.config.branch,
+      model: this.config.model,
     });
 
     this.emitEvent('orchestrator:start', { config: this.config });
@@ -202,16 +190,14 @@ export class Orchestrator extends EventEmitter {
 
   /**
    * Continue the orchestration with new instructions
-   * This is the key v3 feature - session continuity!
+   * This is the key feature - session continuity!
    */
   async continue(prompt: string): Promise<void> {
     if (!this.teamStructure) {
       throw new Error('No team structure - orchestrator not started');
     }
 
-    const leadSession = this.mode === 'flat'
-      ? this.teamStructure.coordinator
-      : this.teamStructure.director;
+    const leadSession = this.teamStructure.lead;
 
     if (!leadSession) {
       throw new Error('No lead session found');
@@ -222,11 +208,18 @@ export class Orchestrator extends EventEmitter {
       promptLength: prompt.length,
     });
 
+    // Create worker agents for delegation
+    const agents = createWorkerAgents(this.config.workerCount);
+
     // Execute continuation on the lead session
     for await (const message of this.sessionManager.executeTask(
       leadSession.id,
       prompt,
-      this.getLeadSessionOptions()
+      {
+        allowedTools: ['Read', 'Glob', 'Grep', 'Task'],
+        agents,
+        model: this.config.model,
+      }
     )) {
       this.handleMessage(leadSession.id, message);
     }
@@ -240,9 +233,9 @@ export class Orchestrator extends EventEmitter {
 
     return {
       state: this.state,
-      mode: this.mode,
       startedAt: this.startedAt,
       elapsedMs: this.startedAt ? Date.now() - this.startedAt.getTime() : 0,
+      workerCount: this.config.workerCount,
       sessions: {
         total: sessionStats.sessionsTotal,
         active: sessionStats.sessionsActive,
@@ -323,8 +316,7 @@ export class Orchestrator extends EventEmitter {
       // Create the target directory
       await mkdir(this.repoPath, { recursive: true });
 
-      // Use rsync to copy (handles symlinks, ignores errors better than cp)
-      // -a = archive mode, -H = preserve hard links, --exclude to skip problematic dirs
+      // Use rsync to copy
       await execa('rsync', [
         '-aH',
         '--exclude', '.orchestrator',
@@ -358,37 +350,41 @@ export class Orchestrator extends EventEmitter {
       await this.runGit(cloneArgs, this.repoPath);
     }
 
-    logger.info('Repository setup complete', { repoPath: this.repoPath });
+    // Set up the work branch (either same as source branch, or a new run branch)
+    if (this.config.useRunBranch) {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      this.workBranch = `run-${timestamp}`;
+
+      await this.runGit(['checkout', '-b', this.workBranch], this.repoPath);
+      await this.runGit(['push', '-u', 'origin', this.workBranch], this.repoPath);
+
+      logger.info('Created run branch', { workBranch: this.workBranch, sourceBranch: branch });
+    } else {
+      this.workBranch = branch;
+    }
+
+    logger.info('Repository setup complete', { repoPath: this.repoPath, workBranch: this.workBranch });
   }
 
   private async createTeamStructure(): Promise<void> {
-    logger.info('Creating team structure', { mode: this.mode });
+    logger.info('Creating team structure', {
+      workerCount: this.config.workerCount,
+    });
 
-    if (this.mode === 'flat') {
-      await this.createFlatStructure();
-    } else {
-      await this.createHierarchyStructure();
-    }
-
-    this.sessionManager.setMode(this.mode);
-    this.emitEvent('mode:selected', { mode: this.mode, details: this.teamStructure! });
-  }
-
-  private async createFlatStructure(): Promise<void> {
-    // Get or create coordinator session
-    let coordinator = this.sessionManager.getSession('coordinator');
-    if (!coordinator) {
-      coordinator = await this.sessionManager.createSession(
-        'coordinator',
-        'coordinator',
+    // Create Lead session (runs in main repo with read-only tools)
+    let lead = this.sessionManager.getSession('lead');
+    if (!lead) {
+      lead = await this.sessionManager.createSession(
+        'lead',
+        'lead',
         this.repoPath,
-        this.config.branch
+        this.workBranch!
       );
     }
 
-    // Get or create worker sessions
+    // Create Worker sessions (each has own worktree)
     const workers: Session[] = [];
-    for (let i = 1; i < this.config.workerCount; i++) {
+    for (let i = 1; i <= this.config.workerCount; i++) {
       const workerId = `worker-${i}`;
       let worker = this.sessionManager.getSession(workerId);
       if (!worker) {
@@ -404,66 +400,14 @@ export class Orchestrator extends EventEmitter {
     }
 
     this.teamStructure = {
-      mode: 'flat',
-      coordinator,
+      lead,
       workers,
     };
-  }
 
-  private async createHierarchyStructure(): Promise<void> {
-    // Get or create director session
-    let director = this.sessionManager.getSession('director');
-    if (!director) {
-      director = await this.sessionManager.createSession(
-        'director',
-        'director',
-        this.repoPath,
-        this.config.branch
-      );
-    }
-
-    // Calculate EM count
-    const emCount = Math.ceil(
-      this.config.workerCount / this.config.engineerManagerGroupSize
-    );
-
-    // Get or create EM teams
-    const engineeringManagers: EngineeringManagerTeam[] = [];
-    let workerIndex = 1;
-
-    for (let emId = 1; emId <= emCount; emId++) {
-      const emSessionId = `em-${emId}`;
-      let manager = this.sessionManager.getSession(emSessionId);
-      if (!manager) {
-        const emPath = await this.createWorktree(emSessionId);
-        manager = await this.sessionManager.createSession(
-          emSessionId,
-          'engineering-manager',
-          emPath,
-          emSessionId
-        );
-      }
-
-      // In hierarchy mode, workers are SDK subagents (not separate sessions)
-      // They run within the EM's context, so no worker sessions/worktrees needed
-      const workersInTeam = Math.min(
-        this.config.engineerManagerGroupSize,
-        this.config.workerCount - (emId - 1) * this.config.engineerManagerGroupSize
-      );
-      workerIndex += workersInTeam;
-
-      engineeringManagers.push({
-        manager,
-        workers: [], // Workers are SDK subagents, not managed sessions
-        assignedFeatures: [],
-      });
-    }
-
-    this.teamStructure = {
-      mode: 'hierarchy',
-      director,
-      engineeringManagers,
-    };
+    logger.info('Team structure created', {
+      lead: lead.id,
+      workers: workers.map(w => w.id),
+    });
   }
 
   private async createWorktree(name: string): Promise<string> {
@@ -507,89 +451,6 @@ export class Orchestrator extends EventEmitter {
     // Read project direction
     const projectDirection = await this.loadProjectDirection();
 
-    if (this.mode === 'flat') {
-      await this.runFlatOrchestration(projectDirection);
-    } else {
-      await this.runHierarchyOrchestration(projectDirection);
-    }
-  }
-
-  private async loadProjectDirection(): Promise<string> {
-    // Use config value if provided
-    if (this.config.projectDirection) {
-      return this.config.projectDirection;
-    }
-
-    // Otherwise try to read from file
-    const projectDirPath = join(this.repoPath!, 'PROJECT_DIRECTION.md');
-    if (existsSync(projectDirPath)) {
-      return await readFile(projectDirPath, 'utf-8');
-    }
-
-    throw new Error('No project direction found. Provide via config or PROJECT_DIRECTION.md');
-  }
-
-  private async runFlatOrchestration(projectDirection: string): Promise<void> {
-    const coordinator = this.teamStructure!.coordinator!;
-
-    // Build the initial prompt for the coordinator
-    const initialPrompt = `
-# Project Direction
-
-${projectDirection}
-
-# Your Team
-
-You have ${this.config.workerCount} workers (including yourself as worker-0):
-- worker-1 through worker-${this.config.workerCount - 1} are available for delegation
-
-# Instructions
-
-1. Analyze the project requirements above
-2. Create a task breakdown
-3. Delegate tasks to your workers
-4. Implement your own assigned portion
-5. Review and merge worker contributions
-6. Ensure the project compiles and tests pass
-
-Start by reading the codebase and creating your plan.
-`;
-
-    // Create worker subagents
-    const agents = createTeamAgents({
-      mode: 'flat',
-      workerCount: this.config.workerCount,
-      engineerManagerGroupSize: this.config.engineerManagerGroupSize,
-      branch: this.config.branch,
-    });
-
-    logger.info('Starting flat mode orchestration');
-
-    // Run the coordinator with streaming
-    for await (const message of this.sessionManager.executeTask(
-      coordinator.id,
-      initialPrompt,
-      {
-        allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
-        agents,
-        model: this.config.models.worker,
-      }
-    )) {
-      this.handleMessage(coordinator.id, message);
-
-      // Check for stop/pause
-      if (this.state === 'stopped') break;
-      while (this.state === 'paused') {
-        await this.sleep(1000);
-      }
-    }
-  }
-
-  private async runHierarchyOrchestration(projectDirection: string): Promise<void> {
-    const director = this.teamStructure!.director!;
-    const emCount = this.teamStructure!.engineeringManagers!.length;
-    const ems = this.teamStructure!.engineeringManagers!;
-
     // Calculate max runtime
     const maxRuntimeMs = (this.config.maxRunDurationMinutes || 120) * 60 * 1000;
     const startTime = Date.now();
@@ -620,29 +481,22 @@ Start by reading the codebase and creating your plan.
       logger.info(`${'='.repeat(60)}\n`);
 
       // Pull latest changes from remote before each iteration
-      // This allows PROJECT_DIRECTION.md updates to be picked up
       try {
-        const branch = this.config.branch;
+        const branch = this.workBranch!;
         await this.runGit(['fetch', 'origin', branch], this.repoPath!, { ignoreError: true });
         await this.runGit(['checkout', branch], this.repoPath!, { ignoreError: true });
         await this.runGit(['pull', 'origin', branch], this.repoPath!, { ignoreError: true });
-        // Re-read PROJECT_DIRECTION.md in case it was updated
-        const directionPath = join(this.repoPath!, 'PROJECT_DIRECTION.md');
-        if (existsSync(directionPath)) {
-          projectDirection = await readFile(directionPath, 'utf-8');
-          logger.info('Refreshed PROJECT_DIRECTION.md');
-        }
       } catch (pullError) {
         logger.warn('Failed to pull latest changes', { error: pullError });
       }
 
       try {
-        await this.runSingleIteration(director, ems, emCount, projectDirection, iteration);
+        await this.runSingleIteration(projectDirection, iteration);
       } catch (error: any) {
         logger.error(`Iteration ${iteration} failed`, { error: error.message });
         // Continue to next iteration unless it's a fatal error
         if (error.message?.includes('No more work')) {
-          logger.info('Director indicated no more work to do');
+          logger.info('Lead indicated no more work to do');
           break;
         }
       }
@@ -651,24 +505,40 @@ Start by reading the codebase and creating your plan.
       await this.sleep(5000);
     }
 
-    logger.info('Hierarchy orchestration complete', {
+    logger.info('Orchestration complete', {
       totalIterations: iteration,
       totalElapsedMinutes: Math.floor((Date.now() - startTime) / 60000),
       stats: this.stats,
     });
   }
 
+  private async loadProjectDirection(): Promise<string> {
+    // Use config value if provided
+    if (this.config.projectDirection) {
+      return this.config.projectDirection;
+    }
+
+    // Otherwise try to read from file
+    const projectDirPath = join(this.repoPath!, 'PROJECT_DIRECTION.md');
+    if (existsSync(projectDirPath)) {
+      return await readFile(projectDirPath, 'utf-8');
+    }
+
+    throw new Error('No project direction found. Provide via config or PROJECT_DIRECTION.md');
+  }
+
   private async runSingleIteration(
-    director: Session,
-    ems: EngineeringManagerTeam[],
-    emCount: number,
     projectDirection: string,
     iteration: number
   ): Promise<void> {
+    const lead = this.teamStructure!.lead;
+    const workers = this.teamStructure!.workers;
+    const workerCount = workers.length;
+
     // ─────────────────────────────────────────────────────────────
-    // Phase 1: Director creates work plan
+    // Phase 1: Lead creates work plan
     // ─────────────────────────────────────────────────────────────
-    logger.info(`[Iteration ${iteration}] Phase 1: Director creating work plan`, { emCount });
+    logger.info(`[Iteration ${iteration}] Phase 1: Lead creating work plan`, { workerCount });
 
     const planPrompt = `
 # Project Direction
@@ -682,8 +552,8 @@ ${iteration > 1 ? 'Previous iterations have already made progress. Focus on REMA
 
 # Your Task
 
-Create a JSON work plan for ${emCount} Engineering Managers (em-1 through em-${emCount}).
-Each EM will work IN PARALLEL on their assigned area.
+Create a JSON work plan for ${workerCount} Workers (worker-1 through worker-${workerCount}).
+Each Worker will work IN PARALLEL on their assigned area.
 
 IMPORTANT:
 - Read the codebase to understand what work remains
@@ -692,7 +562,7 @@ IMPORTANT:
 - If there are still failing tests or incomplete features, assign that work
 
 Output ONLY valid JSON (no markdown code blocks):
-{"assignments": [{"em": "em-1", "area": "...", "files": [...], "tasks": [...], "acceptance": "..."}]}
+{"assignments": [{"worker": "worker-1", "area": "...", "files": [...], "tasks": [...], "acceptance": "..."}]}
 
 If ALL work is truly complete (verified via tests/builds), output:
 {"status": "complete", "reason": "Explanation of how completion was verified"}
@@ -702,16 +572,16 @@ Read the project direction and codebase, then output the JSON plan.
 
     let planJson = '';
     for await (const message of this.sessionManager.executeTask(
-      director.id,
+      lead.id,
       planPrompt,
       {
-        // Restrict director to read-only tools (output JSON as text, not Write)
+        // Lead uses read-only tools (prevents git index locks)
         tools: ['Read', 'Glob', 'Grep'],
         allowedTools: ['Read', 'Glob', 'Grep'],
-        model: this.config.models.director,
+        model: this.config.model,
       }
     )) {
-      this.handleMessage(director.id, message);
+      this.handleMessage(lead.id, message);
 
       // Capture text output for JSON parsing
       if (message.type === 'assistant' && message.message?.content) {
@@ -725,12 +595,12 @@ Read the project direction and codebase, then output the JSON plan.
       if (this.state === 'stopped') return;
     }
 
-    // Parse the director's plan - be flexible about format
-    type Assignment = { em: string; area: string; files: string[]; tasks: string[]; acceptance: string };
+    // Parse the lead's plan
+    type Assignment = { worker: string; area: string; files: string[]; tasks: string[]; acceptance: string };
     let assignments: Assignment[] = [];
 
     try {
-      // Extract JSON from the text - try multiple approaches
+      // Extract JSON from the text
       let cleanJson = '';
 
       // Approach 1: Try to extract from markdown code blocks first
@@ -739,7 +609,7 @@ Read the project direction and codebase, then output the JSON plan.
         cleanJson = codeBlockMatch[1].trim();
       }
 
-      // Approach 2: If no code block or empty, try to find bare JSON object
+      // Approach 2: If no code block, try to find bare JSON object
       if (!cleanJson) {
         const jsonMatch = planJson.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
@@ -748,143 +618,117 @@ Read the project direction and codebase, then output the JSON plan.
       }
 
       if (!cleanJson) {
-        throw new Error('No JSON object found in director output');
+        throw new Error('No JSON object found in lead output');
       }
 
-      // Final cleanup - remove any remaining markdown artifacts
+      // Final cleanup
       cleanJson = cleanJson.replace(/```json?\n?/g, '').replace(/```\n?/g, '').trim();
 
       const parsed = JSON.parse(cleanJson);
 
-      // Check if director says work is complete
+      // Check if lead says work is complete
       if (parsed.status === 'complete') {
-        logger.info('Director indicates all work is complete', { reason: parsed.reason });
+        logger.info('Lead indicates all work is complete', { reason: parsed.reason });
         throw new Error('No more work: ' + (parsed.reason || 'All tasks done'));
       }
 
-      // Handle different JSON structures the director might use
+      // Handle different JSON structures
       if (parsed.assignments && Array.isArray(parsed.assignments)) {
-        // Expected format: { assignments: [...] }
-        // Validate and normalize each assignment
         for (let i = 0; i < parsed.assignments.length; i++) {
           const raw = parsed.assignments[i];
           if (!raw || typeof raw !== 'object') continue;
 
           assignments.push({
-            em: raw.em || `em-${i + 1}`,
+            worker: raw.worker || `worker-${i + 1}`,
             area: String(raw.area || raw.title || raw.description || `Area ${i + 1}`),
             files: Array.isArray(raw.files) ? raw.files : ['src/'],
             tasks: Array.isArray(raw.tasks) ? raw.tasks : ['Implement assigned features'],
             acceptance: String(raw.acceptance || 'Tests pass'),
           });
         }
-      } else if (parsed['em-1'] || parsed['em-2'] || parsed['em-3']) {
-        // Alternative format: { "em-1": {...}, "em-2": {...} }
-        for (const [key, value] of Object.entries(parsed)) {
-          if (key.startsWith('em-') && typeof value === 'object' && value !== null) {
-            const emData = value as Record<string, any>;
-            const focusAreas = Array.isArray(emData.focus_areas) ? emData.focus_areas : [];
-            const priorityIssues = Array.isArray(emData.priority_issues) ? emData.priority_issues : [];
-            assignments.push({
-              em: key,
-              area: String(emData.title || emData.area || focusAreas[0] || 'General'),
-              files: Array.isArray(emData.primary_files) ? emData.primary_files :
-                     Array.isArray(emData.files) ? emData.files : [],
-              tasks: priorityIssues.length > 0
-                ? priorityIssues.map((i: any) => String(i.issue || i.description || i))
-                : Array.isArray(emData.tasks) ? emData.tasks : ['Implement assigned features'],
-              acceptance: String(emData.acceptance || emData.success_criteria || 'All tests pass'),
-            });
-          }
-        }
       }
 
-      logger.info('Director plan parsed', { assignmentCount: assignments.length });
+      logger.info('Lead plan parsed', { assignmentCount: assignments.length });
     } catch (error) {
-      logger.error('Failed to parse director plan', { error, planJson: planJson.substring(0, 1000) });
-      // Fallback: create default assignments for each EM
+      logger.error('Failed to parse lead plan', { error, planJson: planJson.substring(0, 1000) });
+      // Fallback: create default assignments for each worker
       logger.warn('Using fallback plan assignments');
-      for (let i = 1; i <= emCount; i++) {
+      for (let i = 1; i <= workerCount; i++) {
         assignments.push({
-          em: `em-${i}`,
-          area: `Tier ${i - 1} issues from PROJECT_DIRECTION.md`,
+          worker: `worker-${i}`,
+          area: `Section ${i} from PROJECT_DIRECTION.md`,
           files: ['src/'],
-          tasks: ['Read PROJECT_DIRECTION.md', 'Implement assigned tier fixes', 'Run tests'],
+          tasks: ['Read PROJECT_DIRECTION.md', 'Implement assigned section', 'Run tests'],
           acceptance: 'Tests pass and code compiles',
         });
       }
     }
 
-    // Ensure we have assignments for all EMs
+    // Ensure we have assignments for all workers
     if (assignments.length === 0) {
-      logger.warn('No valid assignments from director, using fallback');
-      for (let i = 1; i <= emCount; i++) {
+      logger.warn('No valid assignments from lead, using fallback');
+      for (let i = 1; i <= workerCount; i++) {
         assignments.push({
-          em: `em-${i}`,
-          area: `Tier ${i - 1} issues from PROJECT_DIRECTION.md`,
+          worker: `worker-${i}`,
+          area: `Section ${i} from PROJECT_DIRECTION.md`,
           files: ['src/'],
-          tasks: ['Read PROJECT_DIRECTION.md', 'Implement assigned tier fixes', 'Run tests'],
+          tasks: ['Read PROJECT_DIRECTION.md', 'Implement assigned section', 'Run tests'],
           acceptance: 'Tests pass and code compiles',
         });
       }
     }
 
-    const plan = { assignments };
-
     // ─────────────────────────────────────────────────────────────
-    // Phase 2: Execute EMs in parallel
+    // Phase 2: Execute Workers in parallel
     // ─────────────────────────────────────────────────────────────
-    logger.info(`[Iteration ${iteration}] Phase 2: Spawning EMs in parallel`, {
-      emCount: plan.assignments.length,
-      assignments: plan.assignments.map(a => ({ em: a.em, area: a.area }))
+    logger.info(`[Iteration ${iteration}] Phase 2: Spawning Workers in parallel`, {
+      workerCount: assignments.length,
+      assignments: assignments.map(a => ({ worker: a.worker, area: a.area }))
     });
 
-    const emPromises = plan.assignments.map((assignment) => {
-      const emSession = ems.find(e => e.manager.id === assignment.em);
-      if (!emSession) {
-        logger.warn('EM session not found', { em: assignment.em });
-        return Promise.resolve({ em: assignment.em, success: false, error: 'Session not found', result: undefined });
+    const workerPromises = assignments.map((assignment) => {
+      const workerSession = workers.find(w => w.id === assignment.worker);
+      if (!workerSession) {
+        logger.warn('Worker session not found', { worker: assignment.worker });
+        return Promise.resolve({ worker: assignment.worker, success: false, error: 'Session not found', result: undefined });
       }
-      return this.executeEmAssignment(assignment, emSession, ems, iteration);
+      return this.executeWorkerAssignment(assignment, workerSession, iteration);
     });
 
     // ─────────────────────────────────────────────────────────────
-    // Continuous merge: As each EM completes, merge and reassign
+    // Continuous merge: As each Worker completes, merge and reassign
     // ─────────────────────────────────────────────────────────────
-    const pendingPromises = new Map(emPromises.map((p, i) => [plan.assignments[i].em, p]));
-    const completedEms: string[] = [];
+    const pendingPromises = new Map(workerPromises.map((p, i) => [assignments[i].worker, p]));
+    const completedWorkers: string[] = [];
     let reassignmentRound = 0;
 
     while (pendingPromises.size > 0 && this.state !== 'stopped') {
-      // Wait for any EM to complete
+      // Wait for any Worker to complete
       const raceResult = await Promise.race(
-        Array.from(pendingPromises.entries()).map(async ([emId, promise]) => {
+        Array.from(pendingPromises.entries()).map(async ([workerId, promise]) => {
           const result = await promise;
-          return { emId, result };
+          return { workerId, result };
         })
       );
 
-      const { emId, result } = raceResult;
-      pendingPromises.delete(emId);
-      completedEms.push(emId);
+      const { workerId, result } = raceResult;
+      pendingPromises.delete(workerId);
+      completedWorkers.push(workerId);
 
       if (result.success) {
-        // Immediately merge this EM's branch
-        logger.info(`EM completed, merging: ${emId}`, { resultLength: result.result?.length });
+        // Immediately merge this Worker's branch
+        logger.info(`Worker completed, merging: ${workerId}`, { resultLength: result.result?.length });
         try {
-          const branch = this.config.branch;
-          await this.runGit(['fetch', 'origin', emId], this.repoPath!, { ignoreError: true });
+          const branch = this.workBranch!;
+          await this.runGit(['fetch', 'origin', workerId], this.repoPath!, { ignoreError: true });
           await this.runGit(['checkout', branch], this.repoPath!);
           try {
-            await this.runGit(['merge', `origin/${emId}`, '-m', `Merge ${emId} branch`], this.repoPath!);
+            await this.runGit(['merge', `origin/${workerId}`, '-m', `Merge ${workerId} branch`], this.repoPath!);
             this.stats.merges++;
-            logger.info(`Merged: ${emId}`);
+            logger.info(`Merged: ${workerId}`);
           } catch {
-            logger.warn(`Merge conflict for ${emId}, auto-resolving`);
-            // Smarter conflict resolution:
-            // - For content conflicts: accept theirs (EM's version)
-            // - For deleted files: keep ours (don't delete new files)
-            // Get list of unmerged files and resolve each appropriately
+            logger.warn(`Merge conflict for ${workerId}, auto-resolving`);
+            // Accept theirs for content conflicts
             const unmergedList = await this.runGit(
               ['diff', '--name-only', '--diff-filter=U'],
               this.repoPath!,
@@ -892,42 +736,39 @@ Read the project direction and codebase, then output the JSON plan.
             );
             const unmergedFiles = unmergedList?.split('\n').filter(Boolean) || [];
             for (const file of unmergedFiles) {
-              // Accept theirs for content conflicts, but check if it's a delete
               try {
                 await this.runGit(['checkout', '--theirs', file], this.repoPath!, { ignoreError: true });
               } catch {
-                // If checkout --theirs fails, file was deleted by them - keep ours
                 await this.runGit(['checkout', '--ours', file], this.repoPath!, { ignoreError: true });
               }
             }
             await this.runGit(['add', '.'], this.repoPath!, { ignoreError: true });
-            await this.runGit(['commit', '-m', `Merge ${emId} (auto-resolved)`], this.repoPath!, { ignoreError: true });
+            await this.runGit(['commit', '-m', `Merge ${workerId} (auto-resolved)`], this.repoPath!, { ignoreError: true });
             this.stats.conflicts++;
           }
           // Push after each merge
           await this.runGit(['push', 'origin', branch], this.repoPath!, { ignoreError: true });
         } catch (mergeErr) {
-          logger.error(`Failed to merge ${emId}`, { error: mergeErr });
+          logger.error(`Failed to merge ${workerId}`, { error: mergeErr });
         }
 
-        // Ask director for new work for this EM
-        // First pull latest (in case PROJECT_DIRECTION.md was updated externally)
-        await this.runGit(['pull', 'origin', this.config.branch, '--rebase'], this.repoPath!, { ignoreError: true });
+        // Ask Lead for new work for this Worker
+        await this.runGit(['pull', 'origin', this.workBranch!, '--rebase'], this.repoPath!, { ignoreError: true });
 
         reassignmentRound++;
         const newWorkPrompt = `
-EM ${emId} has completed their work and merged to ${this.config.branch}.
+Worker ${workerId} has completed their work and merged to ${this.workBranch}.
 
 Current status:
-- ${completedEms.length} EMs have completed at least one task
-- ${pendingPromises.size} EMs still working on their current task
+- ${completedWorkers.length} Workers have completed at least one task
+- ${pendingPromises.size} Workers still working on their current task
 - Total reassignments so far: ${reassignmentRound}
 
 Review PROJECT_DIRECTION.md and the current codebase state (git pull was done).
 Check what work remains - run tests, check conformance, etc.
 
-If there is MORE work to do, output a new assignment for ${emId}:
-{"em": "${emId}", "area": "...", "files": [...], "tasks": [...], "acceptance": "..."}
+If there is MORE work to do, output a new assignment for ${workerId}:
+{"worker": "${workerId}", "area": "...", "files": [...], "tasks": [...], "acceptance": "..."}
 
 If ALL work is truly complete (verified), output:
 {"status": "complete", "reason": "Explanation"}
@@ -935,14 +776,14 @@ If ALL work is truly complete (verified), output:
 Output ONLY valid JSON (no markdown).
 `;
 
-        // Get new assignment from director
-        logger.info(`Requesting new work for ${emId}`, { reassignmentRound });
+        // Get new assignment from Lead
+        logger.info(`Requesting new work for ${workerId}`, { reassignmentRound });
         let newAssignmentJson = '';
         try {
           for await (const message of this.sessionManager.executeTask(
-            director.id,
+            lead.id,
             newWorkPrompt,
-            { tools: ['Read', 'Glob', 'Grep', 'Bash'], allowedTools: ['Read', 'Glob', 'Grep', 'Bash'], model: this.config.models.director }
+            { tools: ['Read', 'Glob', 'Grep'], allowedTools: ['Read', 'Glob', 'Grep'], model: this.config.model }
           )) {
             if (message.type === 'assistant' && message.message?.content) {
               for (const block of message.message.content) {
@@ -956,77 +797,131 @@ Output ONLY valid JSON (no markdown).
           if (jsonMatch) {
             const parsed = JSON.parse(jsonMatch[0]);
             if (parsed.status === 'complete') {
-              logger.info(`Director says work complete for ${emId}`, { reason: parsed.reason });
-              // Don't add back to pending - this EM is done
-            } else if (parsed.em && parsed.area) {
-              // Valid new assignment - start EM on new work
-              logger.info(`New assignment for ${emId}`, { area: parsed.area });
-              const emSession = ems.find(e => e.manager.id === emId);
-              if (emSession) {
-                const newPromise = this.executeEmAssignment(parsed, emSession, ems, iteration);
-                pendingPromises.set(emId, newPromise);
+              logger.info(`Lead says work complete for ${workerId}`, { reason: parsed.reason });
+              // Don't add back to pending - this Worker is done
+            } else if (parsed.worker && parsed.area) {
+              // Valid new assignment - start Worker on new work
+              logger.info(`New assignment for ${workerId}`, { area: parsed.area });
+              const workerSession = workers.find(w => w.id === workerId);
+              if (workerSession) {
+                const newPromise = this.executeWorkerAssignment(parsed, workerSession, iteration);
+                pendingPromises.set(workerId, newPromise);
               }
             }
           }
         } catch (reassignError) {
-          logger.warn(`Failed to get reassignment for ${emId}`, { error: reassignError });
+          logger.warn(`Failed to get reassignment for ${workerId}`, { error: reassignError });
         }
       } else {
-        logger.error(`EM failed: ${emId}`, { error: result.error });
+        logger.error(`Worker failed: ${workerId}`, { error: result.error });
       }
     }
 
-    const successful = completedEms;
-    const failed: string[] = [];
-
-    logger.info('All EMs completed', {
-      successful: successful.length,
-      failed: failed.length,
+    logger.info('All Workers completed', {
+      completed: completedWorkers.length,
     });
 
-    // Final sync - ensure branch is pushed
-    const branch = this.config.branch;
+    // Final sync - ensure work branch is pushed
+    const branch = this.workBranch!;
     try {
       await this.runGit(['checkout', branch], this.repoPath!);
       await this.runGit(['fetch', 'origin', branch], this.repoPath!, { ignoreError: true });
       await this.runGit(['rebase', `origin/${branch}`], this.repoPath!, { ignoreError: true });
       await this.runGit(['push', 'origin', branch], this.repoPath!);
-      logger.info(`[Iteration ${iteration}] Final push to origin complete`);
+      logger.info(`[Iteration ${iteration}] Final push to origin complete`, { branch });
     } catch (error) {
-      logger.error(`[Iteration ${iteration}] Final push failed`, { error });
+      logger.error(`[Iteration ${iteration}] Final push failed`, { error, branch });
     }
 
     logger.info(`[Iteration ${iteration}] Complete`, {
-      successful: successful.length,
-      failed: failed.length,
+      completed: completedWorkers.length,
       stats: this.stats,
     });
   }
 
-  private getLeadSessionOptions(): {
-    allowedTools: string[];
-    agents: Record<string, AgentDefinition>;
-    model: 'opus' | 'sonnet' | 'haiku';
-  } {
-    const agents = createTeamAgents({
-      mode: this.mode,
-      workerCount: this.config.workerCount,
-      engineerManagerGroupSize: this.config.engineerManagerGroupSize,
-      branch: this.config.branch,
-    });
+  /**
+   * Execute a Worker assignment
+   */
+  private async executeWorkerAssignment(
+    assignment: { worker: string; area: string; files: string[]; tasks: string[]; acceptance: string },
+    workerSession: Session,
+    iteration: number
+  ): Promise<{ worker: string; success: boolean; result?: string; error?: string }> {
+    const workerPrompt = `
+# Your Assignment: ${assignment.area}
 
-    if (this.mode === 'flat') {
-      return {
-        allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
-        agents,
-        model: this.config.models.worker,
-      };
-    } else {
-      return {
-        allowedTools: ['Read', 'Glob', 'Grep', 'Task'],
-        agents,
-        model: this.config.models.director,
-      };
+You are ${assignment.worker}, a skilled software engineer.
+
+## Files to Focus On
+${assignment.files.map(f => `- ${f}`).join('\n')}
+
+## Tasks
+${assignment.tasks.map((t, i) => `${i + 1}. ${t}`).join('\n')}
+
+## Acceptance Criteria
+${assignment.acceptance}
+
+## CRITICAL RULES
+- IMPLEMENT CODE - do not create documentation
+- Edit source files (.rs, .ts, .js, etc.)
+- Write tests when appropriate
+- Commit with clear messages
+- Push your branch (${assignment.worker}) when done
+
+## Git Workflow
+- Work on your branch (${assignment.worker})
+- Make atomic commits as you complete changes
+- Push when done
+
+**START IMPLEMENTING NOW.**
+`;
+
+    logger.info(`Starting Worker: ${assignment.worker}`, { area: assignment.area, iteration });
+
+    try {
+      let result = '';
+      for await (const message of this.sessionManager.executeTask(
+        workerSession.id,
+        workerPrompt,
+        {
+          tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
+          allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
+          model: this.config.model,
+        }
+      )) {
+        // Log Worker tool calls
+        if (message.type === 'assistant' && message.message?.content) {
+          for (const block of message.message.content) {
+            if (block.type === 'tool_use') {
+              const input = block.input as Record<string, unknown>;
+              let details = '';
+              if (block.name === 'Read' || block.name === 'Write' || block.name === 'Edit') {
+                details = String(input?.file_path || input?.path || '').split('/').slice(-2).join('/');
+              } else if (block.name === 'Bash') {
+                details = String(input?.command || '').slice(0, 60);
+              } else if (block.name === 'Grep' || block.name === 'Glob') {
+                details = String(input?.pattern || '').slice(0, 40);
+              }
+              logger.info('Tool call', { sessionId: assignment.worker, tool: block.name, details: details || undefined });
+              this.emitEvent('tool:start', { sessionId: assignment.worker, tool: block.name, input: block.input });
+            }
+            if (block.type === 'text') {
+              result += block.text;
+            }
+          }
+        }
+
+        if (this.state === 'stopped') {
+          return { worker: assignment.worker, success: false, error: 'Orchestrator stopped' };
+        }
+      }
+
+      logger.info(`Worker completed: ${assignment.worker}`, { resultLength: result.length });
+      return { worker: assignment.worker, success: true, result };
+    } catch (error: any) {
+      const errorMessage = error?.message || error?.shortMessage || String(error);
+      logger.error(`Worker failed: ${assignment.worker}`, { error: errorMessage });
+      return { worker: assignment.worker, success: false, error: errorMessage };
     }
   }
 
@@ -1142,163 +1037,6 @@ Output ONLY valid JSON (no markdown).
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
-
-  /**
-   * Execute an EM assignment - reusable for initial and reassignment
-   */
-  private async executeEmAssignment(
-    assignment: { em: string; area: string; files: string[]; tasks: string[]; acceptance: string },
-    emSession: EngineeringManagerTeam,
-    _ems: EngineeringManagerTeam[],
-    iteration: number
-  ): Promise<{ em: string; success: boolean; result?: string; error?: string }> {
-    // Get worker IDs for this EM's team
-    const emIndex = parseInt(assignment.em.replace('em-', ''));
-    const workersPerEM = this.config.engineerManagerGroupSize;
-    const startWorker = (emIndex - 1) * workersPerEM + 1;
-    const endWorker = Math.min(startWorker + workersPerEM - 1, this.config.workerCount);
-    const workerIds: string[] = [];
-    for (let w = startWorker; w <= endWorker; w++) {
-      workerIds.push(`worker-${w}`);
-    }
-
-    const emPrompt = `
-# Your Assignment: ${assignment.area}
-
-You are ${assignment.em}, an Engineering Manager with a team of ${workerIds.length} workers.
-
-## Your Team
-You can delegate tasks to these workers using the Task tool:
-${workerIds.map(w => `- ${w}`).join('\n')}
-
-## Files to Focus On
-${assignment.files.map(f => `- ${f}`).join('\n')}
-
-## Tasks
-${assignment.tasks.map((t, i) => `${i + 1}. ${t}`).join('\n')}
-
-## Acceptance Criteria
-${assignment.acceptance}
-
-## WORKFLOW - Delegate to Workers!
-
-1. **DELEGATE tasks to your workers** using the Task tool:
-   - Each worker should get a focused, independent task
-   - Be specific about what files to modify and what changes to make
-   - Workers work in parallel - delegate to all of them at once!
-
-2. **Wait for workers to complete**, then:
-   - Review their work
-   - Make any necessary fixes yourself
-   - Commit and push the combined result
-
-Example delegation:
-\`\`\`
-Use Task tool with subagent_type="${workerIds[0]}" and prompt:
-"Implement X in file Y. Specifically: <detailed instructions>"
-\`\`\`
-
-## CRITICAL RULES
-- DELEGATE to workers - don't do everything yourself!
-- Workers implement code, you coordinate and review
-- DO NOT create markdown files or documentation
-- Push your branch (${assignment.em}) when done
-
-**START BY DELEGATING TASKS TO YOUR ${workerIds.length} WORKERS NOW.**
-`;
-
-    logger.info(`Starting EM: ${assignment.em}`, { area: assignment.area, iteration });
-
-    // Create worker agents for this EM
-    const workerAgents: Record<string, import('./agents.js').AgentDefinition> = {};
-    for (const workerId of workerIds) {
-      const workerNum = parseInt(workerId.replace('worker-', ''));
-      workerAgents[workerId] = {
-        description: `Worker ${workerNum}: Implements code changes as assigned.`,
-        prompt: `You are ${workerId}, a software engineer. Implement the assigned task completely.
-- Write clean, production-ready code
-- Make atomic commits with clear messages
-- Focus only on your assigned task
-- Do NOT create documentation files`,
-        tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
-        model: 'sonnet',
-      };
-    }
-
-    try {
-      let result = '';
-      const workerDelegations: string[] = [];
-      for await (const message of this.sessionManager.executeTask(
-        emSession.manager.id,
-        emPrompt,
-        {
-          tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
-          allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
-          agents: workerAgents,
-          model: this.config.models.engineeringManager,
-        }
-      )) {
-        // Log EM-specific tool calls with details
-        if (message.type === 'assistant' && message.message?.content) {
-          for (const block of message.message.content) {
-            if (block.type === 'tool_use') {
-              const input = block.input as Record<string, unknown>;
-              let details = '';
-              if (block.name === 'Read' || block.name === 'Write' || block.name === 'Edit') {
-                details = String(input?.file_path || input?.path || '').split('/').slice(-2).join('/');
-              } else if (block.name === 'Bash') {
-                details = String(input?.command || '').slice(0, 60);
-              } else if (block.name === 'Grep' || block.name === 'Glob') {
-                details = String(input?.pattern || '').slice(0, 40);
-              } else if (block.name === 'Task') {
-                const workerId = String(input?.subagent_type || 'unknown');
-                const promptPreview = String(input?.prompt || '').slice(0, 100).replace(/\n/g, ' ');
-                details = `${workerId}`;
-                workerDelegations.push(workerId);
-                logger.info('Worker delegation', { em: assignment.em, worker: workerId, task: promptPreview + '...' });
-              }
-              logger.info('Tool call', { sessionId: assignment.em, tool: block.name, details: details || undefined });
-              this.emitEvent('tool:start', { sessionId: assignment.em, tool: block.name, input: block.input });
-            }
-            if (block.type === 'text') {
-              result += block.text;
-            }
-          }
-        }
-
-        // Log tool results
-        if (message.type === 'user' && message.message?.content) {
-          for (const block of message.message.content) {
-            if (block.type === 'tool_result' && block.tool_use_id) {
-              const content = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
-              if (content.length > 200) {
-                logger.info('Worker result', {
-                  em: assignment.em,
-                  resultPreview: content.slice(0, 150).replace(/\n/g, ' ') + '...',
-                  resultLength: content.length,
-                });
-              }
-            }
-          }
-        }
-
-        if (this.state === 'stopped') {
-          return { em: assignment.em, success: false, error: 'Orchestrator stopped' };
-        }
-      }
-
-      logger.info(`EM completed: ${assignment.em}`, {
-        resultLength: result.length,
-        workersDelegated: workerDelegations.length,
-        workers: workerDelegations.length > 0 ? workerDelegations : undefined,
-      });
-      return { em: assignment.em, success: true, result };
-    } catch (error: any) {
-      const errorMessage = error?.message || error?.shortMessage || String(error);
-      logger.error(`EM failed: ${assignment.em}`, { error: errorMessage });
-      return { em: assignment.em, success: false, error: errorMessage };
-    }
-  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1322,7 +1060,7 @@ export async function createOrchestratorFromConfig(
     localRepoPath: config.localRepoPath,
     projectDirection: '', // Will be loaded from PROJECT_DIRECTION.md
     workerCount: config.workerCount || 2,
-    engineerManagerGroupSize: config.engineerManagerGroupSize || 4,
+    model: config.model || 'opus',
     authMode: config.authMode || 'oauth',
     taskTimeoutMs: config.taskTimeoutMs || 600000,
     pollIntervalMs: config.pollIntervalMs || 5000,

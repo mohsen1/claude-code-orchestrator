@@ -1,6 +1,7 @@
 /**
  * Orchestrator Types - Agent SDK Based
  *
+ * Simplified Lead/Worker architecture.
  * Sessions maintain context across multiple tasks using the Agent SDK's resume capability.
  */
 
@@ -27,29 +28,26 @@ export interface OrchestratorConfig {
   /** Path to local repo to copy from (faster than cloning) */
   localRepoPath?: string;
   gitCloneOptions?: GitCloneOptions;
+  /** If true, creates a unique run branch instead of committing directly to branch */
+  useRunBranch?: boolean;
 
-  // Team structure
+  // Team structure - simplified
+  /** Number of parallel workers (each gets a worktree) */
   workerCount: number;
-  engineerManagerGroupSize: number; // threshold for hierarchy mode
 
   // Project definition
   projectDirection: string; // Overall goal (from PROJECT_DIRECTION.md or inline)
   projectName?: string;
 
-  // Model configuration
-  models: {
-    director: ModelChoice;
-    engineeringManager: ModelChoice;
-    worker: ModelChoice;
-  };
+  // Model configuration - single model for all agents
+  model: ModelChoice;
 
   // Session management
-  sessionPersistPath?: string; // Where to save session state (default: alongside orchestrator.json)
+  sessionPersistPath?: string; // Where to save session state
   autoResume: boolean; // Resume previous session on restart
 
   // Execution settings
   permissionMode: 'bypassPermissions' | 'acceptEdits';
-  maxConcurrentWorkers: number;
   taskTimeoutMs: number;
   pollIntervalMs: number;
   maxRunDurationMinutes: number;
@@ -68,11 +66,8 @@ export interface OrchestratorConfig {
 // Session Types
 // ─────────────────────────────────────────────────────────────
 
-export type SessionRole =
-  | 'director'
-  | 'engineering-manager'
-  | 'worker'
-  | 'coordinator'; // For flat mode lead
+/** Simplified roles: Lead coordinates, Workers implement */
+export type SessionRole = 'lead' | 'worker';
 
 export type SessionStatus =
   | 'idle'
@@ -83,7 +78,7 @@ export type SessionStatus =
   | 'expired'; // Session TTL exceeded
 
 export interface Session {
-  /** Internal session identifier (e.g., 'worker-1', 'em-2') */
+  /** Internal session identifier (e.g., 'lead', 'worker-1') */
   id: string;
 
   /** Claude session ID from the Agent SDK (set after first query) */
@@ -95,7 +90,7 @@ export interface Session {
   /** Current status */
   status: SessionStatus;
 
-  /** Git worktree path for this session */
+  /** Git worktree path for this session (workers only) */
   worktreePath?: string;
 
   /** Git branch this session works on */
@@ -161,7 +156,7 @@ export interface ToolCallRecord {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Task Types (compatible with v2)
+// Task Types
 // ─────────────────────────────────────────────────────────────
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
@@ -176,7 +171,7 @@ export interface Task {
   acceptanceCriteria?: string[];
   priority: TaskPriority;
   status: TaskStatus;
-  assignedSession?: string; // Session ID instead of worker number
+  assignedSession?: string; // Session ID (e.g., 'worker-1')
   createdAt: Date;
   startedAt?: Date;
   completedAt?: Date;
@@ -194,27 +189,16 @@ export interface TaskResult {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Team Structure Types
+// Team Structure Types - Simplified
 // ─────────────────────────────────────────────────────────────
 
-export type OrchestratorMode = 'flat' | 'hierarchy';
-
+/** Simple Lead + Workers structure */
 export interface TeamStructure {
-  mode: OrchestratorMode;
+  /** Lead session (runs in main repo, read-only) */
+  lead: Session;
 
-  // Flat mode: single coordinator with workers
-  coordinator?: Session;
-  workers?: Session[];
-
-  // Hierarchy mode: director → EMs → workers
-  director?: Session;
-  engineeringManagers?: EngineeringManagerTeam[];
-}
-
-export interface EngineeringManagerTeam {
-  manager: Session;
+  /** Worker sessions (each has a worktree) */
   workers: Session[];
-  assignedFeatures: string[];
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -226,7 +210,6 @@ export type OrchestratorEventType =
   | 'orchestrator:stop'
   | 'orchestrator:pause'
   | 'orchestrator:resume'
-  | 'mode:selected'
   | 'session:created'
   | 'session:resumed'
   | 'session:forked'
@@ -271,9 +254,9 @@ export type OrchestratorState = 'idle' | 'running' | 'paused' | 'stopped';
 
 export interface OrchestratorStatus {
   state: OrchestratorState;
-  mode: OrchestratorMode;
   startedAt?: Date;
   elapsedMs: number;
+  workerCount: number;
   sessions: {
     total: number;
     active: number;
@@ -298,11 +281,11 @@ export interface OrchestratorStatus {
 // ─────────────────────────────────────────────────────────────
 
 export interface PersistedState {
-  version: 3;
+  version: 4; // Bumped for new architecture
   orchestratorId: string;
   startedAt: string; // ISO date
   lastSavedAt: string; // ISO date
-  mode: OrchestratorMode;
+  workerCount: number;
   sessions: PersistedSession[];
   stats: ProgressStats;
 }
@@ -321,7 +304,7 @@ export interface PersistedSession {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Auth Types (reused from v2)
+// Auth Types
 // ─────────────────────────────────────────────────────────────
 
 export interface AuthConfig {

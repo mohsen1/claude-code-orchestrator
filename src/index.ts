@@ -16,11 +16,8 @@ export { SessionManager, type SessionManagerConfig } from './session-manager.js'
 // Agent definitions
 export {
   createWorkerAgent,
-  createEngineeringManagerAgent,
-  createDirectorAgent,
-  createCoordinatorAgent,
-  createTeamAgents,
   createLeadAgent,
+  createWorkerAgents,
   TOOL_SETS,
   type AgentDefinition,
 } from './agents.js';
@@ -64,9 +61,7 @@ export type {
   TaskResult,
 
   // Team structure
-  OrchestratorMode,
   TeamStructure,
-  EngineeringManagerTeam,
 
   // Events
   OrchestratorEvent,

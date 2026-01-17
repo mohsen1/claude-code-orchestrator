@@ -9,6 +9,7 @@ import { EventEmitter } from 'events';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
+import { spawn, type ChildProcess } from 'child_process';
 import {
   query,
   type SDKMessage,
@@ -17,6 +18,8 @@ import {
   type SDKSystemMessage,
   type AgentDefinition,
   type Options as SDKOptions,
+  type SpawnOptions,
+  type SpawnedProcess,
 } from '@anthropic-ai/claude-agent-sdk';
 import type {
   Session,
@@ -221,6 +224,21 @@ export class SessionManager extends EventEmitter {
       allowDangerouslySkipPermissions: this.config.permissionMode === 'bypassPermissions',
       // Convert short model names to full names for the SDK
       model: options.model ? this.getFullModelName(options.model) : undefined,
+      // Custom spawner that ensures node is in PATH (fixes Volta/nvm ENOENT issues)
+      spawnClaudeCodeProcess: (spawnOpts: SpawnOptions): SpawnedProcess => {
+        // Ensure node's bin directory is at the front of PATH
+        const nodeBinDir = process.execPath.replace(/\/node$/, '');
+        const env = {
+          ...spawnOpts.env,
+          PATH: `${nodeBinDir}:${spawnOpts.env.PATH || process.env.PATH}`,
+        };
+        const child = spawn(spawnOpts.command, spawnOpts.args, {
+          cwd: spawnOpts.cwd,
+          env,
+          stdio: ['pipe', 'pipe', 'inherit'],
+        });
+        return child as unknown as SpawnedProcess;
+      },
     };
 
     // Update session state

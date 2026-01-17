@@ -1,0 +1,11 @@
+{
+  "repositoryUrl": "git@github.com:mohsen1/claude-code-orchestrator-e2e-test.git",
+  "branch": "e2e-run-20260117-163422",
+  "model": "opus",
+  "workerCount": 6,
+  "cloneDepth": 100,
+  "engineerManagerGroupSize": 3,
+  "maxRunDurationMinutes": 60,
+  "authMode": "api-keys-first",
+  "workspaceDir": "./e2e/workspace"
+}

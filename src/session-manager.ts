@@ -1,5 +1,5 @@
 /**
- * SessionManager - Core of the v3 Architecture
+ * SessionManager
  *
  * Manages persistent Claude sessions with resume capability.
  * Each session maintains context across multiple task executions.

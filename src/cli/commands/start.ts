@@ -4,8 +4,8 @@ import { join, isAbsolute, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
-import { OrchestratorV3 } from '../../v3/index.js';
-import type { V3OrchestratorConfig, AuthConfig } from '../../v3/types.js';
+import { Orchestrator } from '../../orchestrator.js';
+import type { OrchestratorConfig, AuthConfig } from '../../types.js';
 import { ConfigLoader } from '../../config/loader.js';
 import { logger, configureLogDirectory } from '../../utils/logger.js';
 import { extractRepoName } from '../../utils/repo.js';
@@ -175,7 +175,7 @@ async function createRunLogDirectory(baseDir: string): Promise<string> {
 /**
  * Set up signal handlers for graceful shutdown
  */
-function setupSignalHandlers(orchestrator: OrchestratorV3): void {
+function setupSignalHandlers(orchestrator: Orchestrator): void {
   let isShuttingDown = false;
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -303,7 +303,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
   }
 
   // Build config
-  const v3Config: Partial<V3OrchestratorConfig> & Pick<V3OrchestratorConfig, 'repositoryUrl' | 'branch' | 'workspaceDir' | 'projectDirection'> = {
+  const orchConfig: Partial<OrchestratorConfig> & Pick<OrchestratorConfig, 'repositoryUrl' | 'branch' | 'workspaceDir' | 'projectDirection'> = {
     repositoryUrl: config.repositoryUrl,
     branch: config.branch,
     workspaceDir: workspaceDir!,
@@ -324,7 +324,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
   };
 
   // Create and start orchestrator
-  const orchestrator = new OrchestratorV3(v3Config);
+  const orchestrator = new Orchestrator(orchConfig);
   setupSignalHandlers(orchestrator);
 
   // Forward events to logger with verbose output

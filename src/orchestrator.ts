@@ -1,8 +1,7 @@
 /**
- * V3 Orchestrator - Agent SDK Based
+ * Orchestrator - Agent SDK Based
  *
  * Main orchestration engine using the Claude Agent SDK with session continuity.
- * Compatible with v2's CLI interface and e2e test expectations.
  */
 
 import { EventEmitter } from 'events';
@@ -18,7 +17,7 @@ import {
 } from './agents.js';
 import { createDefaultHooks, gitLock, type HooksConfig } from './hooks.js';
 import type {
-  V3OrchestratorConfig,
+  OrchestratorConfig,
   OrchestratorMode,
   OrchestratorStatus,
   OrchestratorState,
@@ -29,13 +28,13 @@ import type {
   AuthConfig,
   ProgressStats,
 } from './types.js';
-import { logger, configureLogDirectory } from '../utils/logger.js';
+import { logger, configureLogDirectory } from './utils/logger.js';
 
 // ─────────────────────────────────────────────────────────────
 // Default Configuration
 // ─────────────────────────────────────────────────────────────
 
-const DEFAULT_CONFIG: Partial<V3OrchestratorConfig> = {
+const DEFAULT_CONFIG: Partial<OrchestratorConfig> = {
   workerCount: 2,
   engineerManagerGroupSize: 4,
   models: {
@@ -58,8 +57,8 @@ const DEFAULT_CONFIG: Partial<V3OrchestratorConfig> = {
 // Orchestrator Implementation
 // ─────────────────────────────────────────────────────────────
 
-export class OrchestratorV3 extends EventEmitter {
-  private config: V3OrchestratorConfig;
+export class Orchestrator extends EventEmitter {
+  private config: OrchestratorConfig;
   private sessionManager: SessionManager;
   private state: OrchestratorState = 'idle';
   private mode: OrchestratorMode = 'flat';
@@ -82,9 +81,9 @@ export class OrchestratorV3 extends EventEmitter {
     conflicts: 0,
   };
 
-  constructor(config: Partial<V3OrchestratorConfig> & Pick<V3OrchestratorConfig, 'repositoryUrl' | 'branch' | 'workspaceDir' | 'projectDirection'>) {
+  constructor(config: Partial<OrchestratorConfig> & Pick<OrchestratorConfig, 'repositoryUrl' | 'branch' | 'workspaceDir' | 'projectDirection'>) {
     super();
-    this.config = { ...DEFAULT_CONFIG, ...config } as V3OrchestratorConfig;
+    this.config = { ...DEFAULT_CONFIG, ...config } as OrchestratorConfig;
 
     // Determine mode based on worker count vs EM group size
     this.mode = this.config.workerCount > this.config.engineerManagerGroupSize
@@ -126,7 +125,7 @@ export class OrchestratorV3 extends EventEmitter {
     this.state = 'running';
     this.startedAt = new Date();
 
-    logger.info('Starting V3 Orchestrator', {
+    logger.info('Starting Orchestrator', {
       mode: this.mode,
       workerCount: this.config.workerCount,
       branch: this.config.branch,
@@ -1307,17 +1306,16 @@ Use Task tool with subagent_type="${workerIds[0]}" and prompt:
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Create an orchestrator from a config file (v2-compatible interface)
+ * Create an orchestrator from a config file
  */
 export async function createOrchestratorFromConfig(
   configPath: string,
   workspaceDir: string
-): Promise<OrchestratorV3> {
+): Promise<Orchestrator> {
   const content = await readFile(configPath, 'utf-8');
   const config = JSON.parse(content);
 
-  // Map v2 config format to v3
-  const v3Config: Partial<V3OrchestratorConfig> & Pick<V3OrchestratorConfig, 'repositoryUrl' | 'branch' | 'workspaceDir' | 'projectDirection'> = {
+  const orchConfig: Partial<OrchestratorConfig> & Pick<OrchestratorConfig, 'repositoryUrl' | 'branch' | 'workspaceDir' | 'projectDirection'> = {
     repositoryUrl: config.repositoryUrl,
     branch: config.branch,
     workspaceDir,
@@ -1331,5 +1329,5 @@ export async function createOrchestratorFromConfig(
     maxRunDurationMinutes: config.maxRunDurationMinutes || 120,
   };
 
-  return new OrchestratorV3(v3Config);
+  return new Orchestrator(orchConfig);
 }

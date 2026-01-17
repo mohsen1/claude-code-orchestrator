@@ -1,8 +1,7 @@
 /**
- * V3 Architecture Types - Agent SDK Based
+ * Orchestrator Types - Agent SDK Based
  *
- * Key difference from v2: Sessions maintain context across multiple tasks
- * using the Agent SDK's resume capability.
+ * Sessions maintain context across multiple tasks using the Agent SDK's resume capability.
  */
 
 // ─────────────────────────────────────────────────────────────
@@ -20,7 +19,7 @@ export interface GitCloneOptions {
   noSubmodules?: boolean;
 }
 
-export interface V3OrchestratorConfig {
+export interface OrchestratorConfig {
   // Repository settings
   repositoryUrl: string;
   branch: string;

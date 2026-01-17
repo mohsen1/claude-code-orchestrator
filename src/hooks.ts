@@ -1,5 +1,5 @@
 /**
- * SDK Hooks for V3 Architecture
+ * SDK Hooks
  *
  * Provides hook configurations for:
  * - Git operation serialization (prevent index.lock conflicts)

@@ -1,5 +1,5 @@
 /**
- * Agent Definitions for V3 Architecture
+ * Agent Definitions
  *
  * Defines the specialized agents used in the orchestration:
  * - Workers: Implement features, fix bugs

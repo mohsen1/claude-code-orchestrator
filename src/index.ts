@@ -1,24 +1,20 @@
 /**
- * Claude Code Orchestrator (V3)
+ * Claude Code Orchestrator
  *
- * Main module export - re-exports the V3 orchestrator built on the Claude Agent SDK.
+ * Main module export - the orchestrator built on the Claude Agent SDK.
  * For CLI usage, run via `cco` command or `npm start`.
  *
- * The key innovation is session continuity - workers maintain context across
- * multiple tasks using the SDK's resume capability.
+ * Sessions maintain context across multiple tasks using the SDK's resume capability.
  */
 
-// Re-export V3 orchestrator and all components
+// Core orchestrator
+export { Orchestrator, createOrchestratorFromConfig } from './orchestrator.js';
+
+// Session management
+export { SessionManager, type SessionManagerConfig } from './session-manager.js';
+
+// Agent definitions
 export {
-  // Core orchestrator
-  OrchestratorV3,
-  createOrchestratorFromConfig,
-
-  // Session management
-  SessionManager,
-  type SessionManagerConfig,
-
-  // Agent definitions
   createWorkerAgent,
   createEngineeringManagerAgent,
   createDirectorAgent,
@@ -27,8 +23,10 @@ export {
   createLeadAgent,
   TOOL_SETS,
   type AgentDefinition,
+} from './agents.js';
 
-  // Hooks
+// Hooks
+export {
   createGitSafetyHooks,
   createAuditHooks,
   createFileTrackingHooks,
@@ -43,12 +41,12 @@ export {
   type HookResult,
   type HookMatcher,
   type HooksConfig,
-} from './v3/index.js';
+} from './hooks.js';
 
 // Re-export types
 export type {
   // Configuration
-  V3OrchestratorConfig,
+  OrchestratorConfig,
   ModelChoice,
 
   // Sessions
@@ -85,11 +83,11 @@ export type {
 
   // Auth
   AuthConfig,
-} from './v3/index.js';
+} from './types.js';
 
 // Re-export config
 export { OrchestratorConfigSchema } from './config/schema.js';
-export type { OrchestratorConfig } from './config/schema.js';
+export type { OrchestratorConfig as OrchestratorFileConfig } from './config/schema.js';
 
 // Re-export utilities
 export { logger, configureLogDirectory } from './utils/logger.js';

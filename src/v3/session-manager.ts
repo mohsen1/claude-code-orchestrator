@@ -753,9 +753,9 @@ Be comprehensive but concise.
    */
   private getFullModelName(shortName: string): string | undefined {
     const modelMap: Record<string, string> = {
-      opus: 'claude-opus-4-20250514',
-      sonnet: 'claude-sonnet-4-20250514',
-      haiku: 'claude-haiku-3-5-20241022',
+      opus: 'claude-opus-4-5-20251101',
+      sonnet: 'claude-sonnet-4-5-20250929' ,
+      haiku: 'claude-haiku-4-5-20251001',
     };
     return modelMap[shortName] || shortName;
   }

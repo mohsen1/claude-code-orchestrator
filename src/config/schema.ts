@@ -25,7 +25,7 @@ export const OrchestratorConfigSchema = z
     localRepoPath: z.string().min(1).optional(), // Path to local repo to copy from (faster than cloning)
 
     // Worker settings
-    workerCount: z.number().int().min(1).max(20),
+    workerCount: z.number().int().min(1).max(50),
     engineerManagerGroupSize: z.number().int().min(1).max(8).default(4),
     model: z.string().optional(), // Claude model: 'haiku', 'sonnet', 'opus', or full model name
 

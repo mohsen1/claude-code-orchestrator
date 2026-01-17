@@ -204,7 +204,7 @@ You MUST output ONLY this JSON structure (no markdown, no explanation):
 // Coordinator Agent (Flat Mode)
 // ─────────────────────────────────────────────────────────────
 
-export function createCoordinatorAgent(workerCount: number): AgentDefinition {
+export function createCoordinatorAgent(workerCount: number, branch: string = 'main'): AgentDefinition {
   return {
     description: `Lead Developer: Coordinates ${workerCount} workers in flat team structure.`,
     prompt: `You are the Lead Developer coordinating this software project.
@@ -246,11 +246,11 @@ When delegating:
 ## Code Review & Merging
 When workers complete tasks:
 1. Fetch their branch: \`git fetch origin <branch>\`
-2. Review changes: \`git diff main..<branch>\`
+2. Review changes: \`git diff ${branch}..<branch>\`
 3. Merge if approved: \`git merge <branch>\`
 4. Resolve conflicts if needed
-5. Fetch and rebase: \`git fetch origin main && git rebase origin/main\`
-6. Push: \`git push origin main\`
+5. Fetch and rebase: \`git fetch origin ${branch} && git rebase origin/${branch}\`
+6. Push: \`git push origin ${branch}\`
 
 ## Your Own Implementation
 As worker-0, you handle:
@@ -275,6 +275,7 @@ export interface TeamAgentConfig {
   mode: 'flat' | 'hierarchy';
   workerCount: number;
   engineerManagerGroupSize: number;
+  branch: string;
 }
 
 /**
@@ -312,7 +313,7 @@ export function createTeamAgents(config: TeamAgentConfig): Record<string, AgentD
  */
 export function createLeadAgent(config: TeamAgentConfig): AgentDefinition {
   if (config.mode === 'flat') {
-    return createCoordinatorAgent(config.workerCount);
+    return createCoordinatorAgent(config.workerCount, config.branch);
   } else {
     const emCount = Math.ceil(config.workerCount / config.engineerManagerGroupSize);
     return createDirectorAgent(emCount, config.workerCount);

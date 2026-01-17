@@ -445,32 +445,17 @@ export class OrchestratorV3 extends EventEmitter {
         );
       }
 
-      // Get or create workers for this EM
-      const workers: Session[] = [];
+      // In hierarchy mode, workers are SDK subagents (not separate sessions)
+      // They run within the EM's context, so no worker sessions/worktrees needed
       const workersInTeam = Math.min(
         this.config.engineerManagerGroupSize,
         this.config.workerCount - (emId - 1) * this.config.engineerManagerGroupSize
       );
-
-      for (let i = 0; i < workersInTeam && workerIndex <= this.config.workerCount; i++) {
-        const workerId = `worker-${workerIndex}`;
-        let worker = this.sessionManager.getSession(workerId);
-        if (!worker) {
-          const workerPath = await this.createWorktree(workerId);
-          worker = await this.sessionManager.createSession(
-            workerId,
-            'worker',
-            workerPath,
-            workerId
-          );
-        }
-        workers.push(worker);
-        workerIndex++;
-      }
+      workerIndex += workersInTeam;
 
       engineeringManagers.push({
         manager,
-        workers,
+        workers: [], // Workers are SDK subagents, not managed sessions
         assignedFeatures: [],
       });
     }
@@ -575,6 +560,7 @@ Start by reading the codebase and creating your plan.
       mode: 'flat',
       workerCount: this.config.workerCount,
       engineerManagerGroupSize: this.config.engineerManagerGroupSize,
+      branch: this.config.branch,
     });
 
     logger.info('Starting flat mode orchestration');
@@ -633,6 +619,23 @@ Start by reading the codebase and creating your plan.
       });
       logger.info(`${'='.repeat(60)}\n`);
 
+      // Pull latest changes from remote before each iteration
+      // This allows PROJECT_DIRECTION.md updates to be picked up
+      try {
+        const branch = this.config.branch;
+        await this.runGit(['fetch', 'origin', branch], this.repoPath!, { ignoreError: true });
+        await this.runGit(['checkout', branch], this.repoPath!, { ignoreError: true });
+        await this.runGit(['pull', 'origin', branch], this.repoPath!, { ignoreError: true });
+        // Re-read PROJECT_DIRECTION.md in case it was updated
+        const directionPath = join(this.repoPath!, 'PROJECT_DIRECTION.md');
+        if (existsSync(directionPath)) {
+          projectDirection = await readFile(directionPath, 'utf-8');
+          logger.info('Refreshed PROJECT_DIRECTION.md');
+        }
+      } catch (pullError) {
+        logger.warn('Failed to pull latest changes', { error: pullError });
+      }
+
       try {
         await this.runSingleIteration(director, ems, emCount, projectDirection, iteration);
       } catch (error: any) {
@@ -675,20 +678,26 @@ ${projectDirection}
 # Current Status
 
 This is iteration ${iteration} of continuous development.
-${iteration > 1 ? 'Previous iterations have already made progress. Focus on REMAINING work.' : 'This is the first iteration.'}
+${iteration > 1 ? 'Previous iterations have already made progress. Focus on REMAINING work that has not been completed yet.' : 'This is the first iteration.'}
 
 # Your Task
 
 Create a JSON work plan for ${emCount} Engineering Managers (em-1 through em-${emCount}).
 Each EM will work IN PARALLEL on their assigned area.
 
-If you believe ALL work in PROJECT_DIRECTION.md is complete, output:
-{"status": "complete", "reason": "All tasks done"}
+IMPORTANT:
+- Read the codebase to understand what work remains
+- Check test results, build status, or other project-specific verification methods
+- Only report complete when ALL documented tasks are verifiably done
+- If there are still failing tests or incomplete features, assign that work
 
-Otherwise, output assignments for the NEXT batch of work:
-{"assignments": [...]}
+Output ONLY valid JSON (no markdown code blocks):
+{"assignments": [{"em": "em-1", "area": "...", "files": [...], "tasks": [...], "acceptance": "..."}]}
 
-Read the project direction and output ONLY valid JSON.
+If ALL work is truly complete (verified via tests/builds), output:
+{"status": "complete", "reason": "Explanation of how completion was verified"}
+
+Read the project direction and codebase, then output the JSON plan.
 `;
 
     let planJson = '';
@@ -830,144 +839,161 @@ Read the project direction and output ONLY valid JSON.
       assignments: plan.assignments.map(a => ({ em: a.em, area: a.area }))
     });
 
-    const emPromises = plan.assignments.map(async (assignment) => {
+    const emPromises = plan.assignments.map((assignment) => {
       const emSession = ems.find(e => e.manager.id === assignment.em);
       if (!emSession) {
         logger.warn('EM session not found', { em: assignment.em });
-        return { em: assignment.em, success: false, error: 'Session not found' };
+        return Promise.resolve({ em: assignment.em, success: false, error: 'Session not found', result: undefined });
       }
+      return this.executeEmAssignment(assignment, emSession, ems, iteration);
+    });
 
-      const emPrompt = `
-# Your Assignment: ${assignment.area}
+    // ─────────────────────────────────────────────────────────────
+    // Continuous merge: As each EM completes, merge and reassign
+    // ─────────────────────────────────────────────────────────────
+    const pendingPromises = new Map(emPromises.map((p, i) => [plan.assignments[i].em, p]));
+    const completedEms: string[] = [];
+    let reassignmentRound = 0;
 
-You are ${assignment.em}, a senior developer. Your job is to IMPLEMENT CODE, not create documentation.
+    while (pendingPromises.size > 0 && this.state !== 'stopped') {
+      // Wait for any EM to complete
+      const raceResult = await Promise.race(
+        Array.from(pendingPromises.entries()).map(async ([emId, promise]) => {
+          const result = await promise;
+          return { emId, result };
+        })
+      );
 
-## Files to Focus On
-${assignment.files.map(f => `- ${f}`).join('\n')}
+      const { emId, result } = raceResult;
+      pendingPromises.delete(emId);
+      completedEms.push(emId);
 
-## Tasks
-${assignment.tasks.map((t, i) => `${i + 1}. ${t}`).join('\n')}
+      if (result.success) {
+        // Immediately merge this EM's branch
+        logger.info(`EM completed, merging: ${emId}`, { resultLength: result.result?.length });
+        try {
+          const branch = this.config.branch;
+          await this.runGit(['fetch', 'origin', emId], this.repoPath!, { ignoreError: true });
+          await this.runGit(['checkout', branch], this.repoPath!);
+          try {
+            await this.runGit(['merge', `origin/${emId}`, '-m', `Merge ${emId} branch`], this.repoPath!);
+            this.stats.merges++;
+            logger.info(`Merged: ${emId}`);
+          } catch {
+            logger.warn(`Merge conflict for ${emId}, auto-resolving`);
+            // Smarter conflict resolution:
+            // - For content conflicts: accept theirs (EM's version)
+            // - For deleted files: keep ours (don't delete new files)
+            // Get list of unmerged files and resolve each appropriately
+            const unmergedList = await this.runGit(
+              ['diff', '--name-only', '--diff-filter=U'],
+              this.repoPath!,
+              { ignoreError: true }
+            );
+            const unmergedFiles = unmergedList?.split('\n').filter(Boolean) || [];
+            for (const file of unmergedFiles) {
+              // Accept theirs for content conflicts, but check if it's a delete
+              try {
+                await this.runGit(['checkout', '--theirs', file], this.repoPath!, { ignoreError: true });
+              } catch {
+                // If checkout --theirs fails, file was deleted by them - keep ours
+                await this.runGit(['checkout', '--ours', file], this.repoPath!, { ignoreError: true });
+              }
+            }
+            await this.runGit(['add', '.'], this.repoPath!, { ignoreError: true });
+            await this.runGit(['commit', '-m', `Merge ${emId} (auto-resolved)`], this.repoPath!, { ignoreError: true });
+            this.stats.conflicts++;
+          }
+          // Push after each merge
+          await this.runGit(['push', 'origin', branch], this.repoPath!, { ignoreError: true });
+        } catch (mergeErr) {
+          logger.error(`Failed to merge ${emId}`, { error: mergeErr });
+        }
 
-## Acceptance Criteria
-${assignment.acceptance}
+        // Ask director for new work for this EM
+        // First pull latest (in case PROJECT_DIRECTION.md was updated externally)
+        await this.runGit(['pull', 'origin', this.config.branch, '--rebase'], this.repoPath!, { ignoreError: true });
 
-## CRITICAL RULES
-- IMPLEMENT actual code changes (edit .rs, .ts, .js files)
-- DO NOT create markdown files or documentation
-- Commit your changes with descriptive messages
-- Push your branch (${assignment.em}) when done
+        reassignmentRound++;
+        const newWorkPrompt = `
+EM ${emId} has completed their work and merged to ${this.config.branch}.
 
-## Workflow
-1. Read the relevant source files
-2. Make the code changes
-3. Test your changes if possible
-4. Commit: git add . && git commit -m "feat: <description>"
-5. Fetch latest: git fetch origin main && git rebase origin/main (resolve any conflicts)
-6. Push: git push origin ${assignment.em}
+Current status:
+- ${completedEms.length} EMs have completed at least one task
+- ${pendingPromises.size} EMs still working on their current task
+- Total reassignments so far: ${reassignmentRound}
 
-**START IMPLEMENTING NOW.**
+Review PROJECT_DIRECTION.md and the current codebase state (git pull was done).
+Check what work remains - run tests, check conformance, etc.
+
+If there is MORE work to do, output a new assignment for ${emId}:
+{"em": "${emId}", "area": "...", "files": [...], "tasks": [...], "acceptance": "..."}
+
+If ALL work is truly complete (verified), output:
+{"status": "complete", "reason": "Explanation"}
+
+Output ONLY valid JSON (no markdown).
 `;
 
-      logger.info(`Starting EM: ${assignment.em}`, { area: assignment.area });
-
-      try {
-        let result = '';
-        for await (const message of this.sessionManager.executeTask(
-          emSession.manager.id,
-          emPrompt,
-          {
-            // Restrict available tools (no Task - EMs implement directly)
-            tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
-            allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
-            model: this.config.models.engineeringManager,
-          }
-        )) {
-          // Log EM-specific tool calls
-          if (message.type === 'assistant' && message.message?.content) {
-            for (const block of message.message.content) {
-              if (block.type === 'tool_use') {
-                logger.info('Tool call', { sessionId: assignment.em, tool: block.name });
-                this.emitEvent('tool:start', { sessionId: assignment.em, tool: block.name, input: block.input });
-              }
-              if (block.type === 'text') {
-                result += block.text;
+        // Get new assignment from director
+        logger.info(`Requesting new work for ${emId}`, { reassignmentRound });
+        let newAssignmentJson = '';
+        try {
+          for await (const message of this.sessionManager.executeTask(
+            director.id,
+            newWorkPrompt,
+            { tools: ['Read', 'Glob', 'Grep', 'Bash'], allowedTools: ['Read', 'Glob', 'Grep', 'Bash'], model: this.config.models.director }
+          )) {
+            if (message.type === 'assistant' && message.message?.content) {
+              for (const block of message.message.content) {
+                if (block.type === 'text') newAssignmentJson += block.text;
               }
             }
           }
 
-          if (this.state === 'stopped') {
-            return { em: assignment.em, success: false, error: 'Orchestrator stopped' };
+          // Parse the response
+          const jsonMatch = newAssignmentJson.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (parsed.status === 'complete') {
+              logger.info(`Director says work complete for ${emId}`, { reason: parsed.reason });
+              // Don't add back to pending - this EM is done
+            } else if (parsed.em && parsed.area) {
+              // Valid new assignment - start EM on new work
+              logger.info(`New assignment for ${emId}`, { area: parsed.area });
+              const emSession = ems.find(e => e.manager.id === emId);
+              if (emSession) {
+                const newPromise = this.executeEmAssignment(parsed, emSession, ems, iteration);
+                pendingPromises.set(emId, newPromise);
+              }
+            }
           }
+        } catch (reassignError) {
+          logger.warn(`Failed to get reassignment for ${emId}`, { error: reassignError });
         }
-
-        logger.info(`EM completed: ${assignment.em}`, { resultLength: result.length });
-        return { em: assignment.em, success: true, result };
-      } catch (error: any) {
-        const errorMessage = error?.message || error?.shortMessage || String(error);
-        const errorStack = error?.stack;
-        logger.error(`EM failed: ${assignment.em}`, { error: errorMessage, stack: errorStack });
-        return { em: assignment.em, success: false, error: errorMessage };
+      } else {
+        logger.error(`EM failed: ${emId}`, { error: result.error });
       }
-    });
+    }
 
-    // Wait for all EMs to complete
-    const emResults = await Promise.all(emPromises);
-
-    const successful = emResults.filter(r => r.success);
-    const failed = emResults.filter(r => !r.success);
+    const successful = completedEms;
+    const failed: string[] = [];
 
     logger.info('All EMs completed', {
       successful: successful.length,
       failed: failed.length,
-      failedEms: failed.map(f => f.em)
     });
 
-    // ─────────────────────────────────────────────────────────────
-    // Phase 3: Merge EM branches
-    // ─────────────────────────────────────────────────────────────
-    logger.info(`[Iteration ${iteration}] Phase 3: Merging EM branches`);
-
-    for (const result of successful) {
-      try {
-        logger.info(`Merging branch: ${result.em}`);
-
-        // Fetch and merge
-        await this.runGit(['fetch', 'origin', result.em], this.repoPath!, { ignoreError: true });
-        await this.runGit(['checkout', 'main'], this.repoPath!);
-
-        try {
-          await this.runGit(['merge', `origin/${result.em}`, '-m', `Merge ${result.em} branch`], this.repoPath!);
-          this.stats.merges++;
-          logger.info(`Merged: ${result.em}`);
-        } catch (mergeError) {
-          logger.warn(`Merge conflict for ${result.em}, attempting auto-resolve`);
-          // Try to auto-resolve by accepting theirs for conflicts
-          await this.runGit(['checkout', '--theirs', '.'], this.repoPath!, { ignoreError: true });
-          await this.runGit(['add', '.'], this.repoPath!, { ignoreError: true });
-          await this.runGit(['commit', '-m', `Merge ${result.em} (auto-resolved)`], this.repoPath!, { ignoreError: true });
-          this.stats.conflicts++;
-        }
-      } catch (error) {
-        logger.error(`Failed to merge ${result.em}`, { error });
-      }
-    }
-
-    // Push final result - pull first to prevent rejection
+    // Final sync - ensure branch is pushed
+    const branch = this.config.branch;
     try {
-      // Fetch and rebase to get any remote changes
-      await this.runGit(['fetch', 'origin', 'main'], this.repoPath!, { ignoreError: true });
-      await this.runGit(['rebase', 'origin/main'], this.repoPath!, { ignoreError: true });
-      await this.runGit(['push', 'origin', 'main'], this.repoPath!);
-      logger.info(`[Iteration ${iteration}] Pushed merged result to origin`);
+      await this.runGit(['checkout', branch], this.repoPath!);
+      await this.runGit(['fetch', 'origin', branch], this.repoPath!, { ignoreError: true });
+      await this.runGit(['rebase', `origin/${branch}`], this.repoPath!, { ignoreError: true });
+      await this.runGit(['push', 'origin', branch], this.repoPath!);
+      logger.info(`[Iteration ${iteration}] Final push to origin complete`);
     } catch (error) {
-      // If push still fails, try pull --rebase then push again
-      try {
-        await this.runGit(['pull', '--rebase', 'origin', 'main'], this.repoPath!);
-        await this.runGit(['push', 'origin', 'main'], this.repoPath!);
-        logger.info(`[Iteration ${iteration}] Pushed merged result to origin (after pull)`);
-      } catch (retryError) {
-        logger.error(`[Iteration ${iteration}] Failed to push to origin`, { error: retryError });
-      }
+      logger.error(`[Iteration ${iteration}] Final push failed`, { error });
     }
 
     logger.info(`[Iteration ${iteration}] Complete`, {
@@ -986,6 +1012,7 @@ ${assignment.acceptance}
       mode: this.mode,
       workerCount: this.config.workerCount,
       engineerManagerGroupSize: this.config.engineerManagerGroupSize,
+      branch: this.config.branch,
     });
 
     if (this.mode === 'flat') {
@@ -1023,9 +1050,25 @@ ${assignment.acceptance}
       });
     }
 
-    // Check for git operations in tool calls
+    // Log all tool calls with details
     if (message.type === 'assistant' && message.message?.content) {
       for (const block of message.message.content) {
+        if (block.type === 'tool_use') {
+          const input = block.input as Record<string, unknown>;
+          let details = '';
+          if (block.name === 'Read' || block.name === 'Write' || block.name === 'Edit') {
+            details = String(input?.file_path || input?.path || '').split('/').slice(-2).join('/');
+          } else if (block.name === 'Bash') {
+            details = String(input?.command || '').slice(0, 80);
+          } else if (block.name === 'Grep' || block.name === 'Glob') {
+            details = String(input?.pattern || '').slice(0, 50);
+          } else if (block.name === 'Task') {
+            details = `subagent=${input?.subagent_type}, prompt=${String(input?.prompt || '').slice(0, 50)}...`;
+          }
+          logger.info('Tool call', { sessionId, tool: block.name, details: details || undefined });
+        }
+
+        // Check for git operations
         if (block.type === 'tool_use' && block.name === 'Bash') {
           const command = (block.input as any)?.command || '';
           if (command.includes('git commit')) {
@@ -1098,6 +1141,163 @@ ${assignment.acceptance}
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Execute an EM assignment - reusable for initial and reassignment
+   */
+  private async executeEmAssignment(
+    assignment: { em: string; area: string; files: string[]; tasks: string[]; acceptance: string },
+    emSession: EngineeringManagerTeam,
+    _ems: EngineeringManagerTeam[],
+    iteration: number
+  ): Promise<{ em: string; success: boolean; result?: string; error?: string }> {
+    // Get worker IDs for this EM's team
+    const emIndex = parseInt(assignment.em.replace('em-', ''));
+    const workersPerEM = this.config.engineerManagerGroupSize;
+    const startWorker = (emIndex - 1) * workersPerEM + 1;
+    const endWorker = Math.min(startWorker + workersPerEM - 1, this.config.workerCount);
+    const workerIds: string[] = [];
+    for (let w = startWorker; w <= endWorker; w++) {
+      workerIds.push(`worker-${w}`);
+    }
+
+    const emPrompt = `
+# Your Assignment: ${assignment.area}
+
+You are ${assignment.em}, an Engineering Manager with a team of ${workerIds.length} workers.
+
+## Your Team
+You can delegate tasks to these workers using the Task tool:
+${workerIds.map(w => `- ${w}`).join('\n')}
+
+## Files to Focus On
+${assignment.files.map(f => `- ${f}`).join('\n')}
+
+## Tasks
+${assignment.tasks.map((t, i) => `${i + 1}. ${t}`).join('\n')}
+
+## Acceptance Criteria
+${assignment.acceptance}
+
+## WORKFLOW - Delegate to Workers!
+
+1. **DELEGATE tasks to your workers** using the Task tool:
+   - Each worker should get a focused, independent task
+   - Be specific about what files to modify and what changes to make
+   - Workers work in parallel - delegate to all of them at once!
+
+2. **Wait for workers to complete**, then:
+   - Review their work
+   - Make any necessary fixes yourself
+   - Commit and push the combined result
+
+Example delegation:
+\`\`\`
+Use Task tool with subagent_type="${workerIds[0]}" and prompt:
+"Implement X in file Y. Specifically: <detailed instructions>"
+\`\`\`
+
+## CRITICAL RULES
+- DELEGATE to workers - don't do everything yourself!
+- Workers implement code, you coordinate and review
+- DO NOT create markdown files or documentation
+- Push your branch (${assignment.em}) when done
+
+**START BY DELEGATING TASKS TO YOUR ${workerIds.length} WORKERS NOW.**
+`;
+
+    logger.info(`Starting EM: ${assignment.em}`, { area: assignment.area, iteration });
+
+    // Create worker agents for this EM
+    const workerAgents: Record<string, import('./agents.js').AgentDefinition> = {};
+    for (const workerId of workerIds) {
+      const workerNum = parseInt(workerId.replace('worker-', ''));
+      workerAgents[workerId] = {
+        description: `Worker ${workerNum}: Implements code changes as assigned.`,
+        prompt: `You are ${workerId}, a software engineer. Implement the assigned task completely.
+- Write clean, production-ready code
+- Make atomic commits with clear messages
+- Focus only on your assigned task
+- Do NOT create documentation files`,
+        tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
+        model: 'sonnet',
+      };
+    }
+
+    try {
+      let result = '';
+      const workerDelegations: string[] = [];
+      for await (const message of this.sessionManager.executeTask(
+        emSession.manager.id,
+        emPrompt,
+        {
+          tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
+          allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
+          agents: workerAgents,
+          model: this.config.models.engineeringManager,
+        }
+      )) {
+        // Log EM-specific tool calls with details
+        if (message.type === 'assistant' && message.message?.content) {
+          for (const block of message.message.content) {
+            if (block.type === 'tool_use') {
+              const input = block.input as Record<string, unknown>;
+              let details = '';
+              if (block.name === 'Read' || block.name === 'Write' || block.name === 'Edit') {
+                details = String(input?.file_path || input?.path || '').split('/').slice(-2).join('/');
+              } else if (block.name === 'Bash') {
+                details = String(input?.command || '').slice(0, 60);
+              } else if (block.name === 'Grep' || block.name === 'Glob') {
+                details = String(input?.pattern || '').slice(0, 40);
+              } else if (block.name === 'Task') {
+                const workerId = String(input?.subagent_type || 'unknown');
+                const promptPreview = String(input?.prompt || '').slice(0, 100).replace(/\n/g, ' ');
+                details = `${workerId}`;
+                workerDelegations.push(workerId);
+                logger.info('Worker delegation', { em: assignment.em, worker: workerId, task: promptPreview + '...' });
+              }
+              logger.info('Tool call', { sessionId: assignment.em, tool: block.name, details: details || undefined });
+              this.emitEvent('tool:start', { sessionId: assignment.em, tool: block.name, input: block.input });
+            }
+            if (block.type === 'text') {
+              result += block.text;
+            }
+          }
+        }
+
+        // Log tool results
+        if (message.type === 'user' && message.message?.content) {
+          for (const block of message.message.content) {
+            if (block.type === 'tool_result' && block.tool_use_id) {
+              const content = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+              if (content.length > 200) {
+                logger.info('Worker result', {
+                  em: assignment.em,
+                  resultPreview: content.slice(0, 150).replace(/\n/g, ' ') + '...',
+                  resultLength: content.length,
+                });
+              }
+            }
+          }
+        }
+
+        if (this.state === 'stopped') {
+          return { em: assignment.em, success: false, error: 'Orchestrator stopped' };
+        }
+      }
+
+      logger.info(`EM completed: ${assignment.em}`, {
+        resultLength: result.length,
+        workersDelegated: workerDelegations.length,
+        workers: workerDelegations.length > 0 ? workerDelegations : undefined,
+      });
+      return { em: assignment.em, success: true, result };
+    } catch (error: any) {
+      const errorMessage = error?.message || error?.shortMessage || String(error);
+      logger.error(`EM failed: ${assignment.em}`, { error: errorMessage });
+      return { em: assignment.em, success: false, error: errorMessage };
+    }
   }
 }
 

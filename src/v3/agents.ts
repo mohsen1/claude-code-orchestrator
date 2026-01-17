@@ -249,7 +249,8 @@ When workers complete tasks:
 2. Review changes: \`git diff main..<branch>\`
 3. Merge if approved: \`git merge <branch>\`
 4. Resolve conflicts if needed
-5. Push: \`git push origin main\`
+5. Fetch and rebase: \`git fetch origin main && git rebase origin/main\`
+6. Push: \`git push origin main\`
 
 ## Your Own Implementation
 As worker-0, you handle:

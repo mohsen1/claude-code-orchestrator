@@ -1,6 +1,6 @@
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, mkdir, writeFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join, isAbsolute } from 'node:path';
+import { join, isAbsolute, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
@@ -225,7 +225,25 @@ export async function startCommand(options: StartOptions): Promise<void> {
     configDir = setup.configDir;
     workspaceDir = setup.workspaceDir;
   } else {
-    configDir = options.config;
+    // options.config can be either a file path or a directory path
+    // Check if it's a file (ends with .json) or directory
+    try {
+      const configStat = await stat(options.config);
+      if (configStat.isFile()) {
+        // It's a file path, extract the directory
+        configDir = dirname(options.config);
+      } else {
+        // It's a directory path
+        configDir = options.config;
+      }
+    } catch {
+      // Path doesn't exist yet or can't be accessed, check if it ends with .json
+      if (options.config.endsWith('.json')) {
+        configDir = dirname(options.config);
+      } else {
+        configDir = options.config;
+      }
+    }
     workspaceDir = options.workspace;
   }
 
@@ -311,23 +329,33 @@ export async function startCommand(options: StartOptions): Promise<void> {
 
   // Forward events to logger with verbose output
   orchestrator.on('tool:start', (event) => {
-    logger.info('Tool call', { sessionId: event.data.sessionId, tool: event.data.tool });
+    if (event?.data) {
+      logger.info('Tool call', { sessionId: event.data.sessionId, tool: event.data.tool });
+    }
   });
 
   orchestrator.on('task:complete', (event) => {
-    logger.info('Task completed', { sessionId: event.data.sessionId, resultLength: event.data.result?.length || 0 });
+    if (event?.data) {
+      logger.info('Task completed', { sessionId: event.data.sessionId, resultLength: event.data.result?.length || 0 });
+    }
   });
 
   orchestrator.on('task:error', (event) => {
-    logger.error('Task error', { sessionId: event.data.sessionId, error: event.data.error });
+    if (event?.data) {
+      logger.error('Task error', { sessionId: event.data.sessionId, error: event.data.error });
+    }
   });
 
   orchestrator.on('query:start', (event) => {
-    logger.info('Query started', { sessionId: event.data.sessionId });
+    if (event?.data) {
+      logger.info('Query started', { sessionId: event.data.sessionId });
+    }
   });
 
   orchestrator.on('query:message', (event) => {
-    logger.debug('Query message', { sessionId: event.data.sessionId, type: event.data.type });
+    if (event?.data) {
+      logger.debug('Query message', { sessionId: event.data.sessionId, type: event.data.type });
+    }
   });
 
   orchestrator.on('text:stream', (data) => {

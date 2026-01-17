@@ -257,11 +257,14 @@ async function createTestBranch(): Promise<string> {
     };
     await writeFile(join(tmpDir, 'tsconfig.json'), JSON.stringify(tsconfig, null, 2));
 
-    // Create src directory
+    // Remove any existing source files - we want a fresh start with only PROJECT_DIRECTION.md
+    await rm(join(tmpDir, 'src'), { recursive: true, force: true });
+
+    // Create empty src directory
     await mkdir(join(tmpDir, 'src'), { recursive: true });
     await writeFile(join(tmpDir, 'src', '.gitkeep'), '');
 
-    // Commit and push (skip commit if repo already matches expected seed state)
+    // Commit and push
     await runCommand('git', ['add', '.'], { cwd: tmpDir });
     const status = await runCommand('git', ['status', '--porcelain'], { cwd: tmpDir, reject: false });
     if (status.stdout.trim().length > 0) {

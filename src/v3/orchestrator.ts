@@ -721,15 +721,29 @@ Read the project direction and output ONLY valid JSON.
     let assignments: Assignment[] = [];
 
     try {
-      // Extract JSON from the text (handle text before/after JSON)
-      const jsonMatch = planJson.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
+      // Extract JSON from the text - try multiple approaches
+      let cleanJson = '';
+
+      // Approach 1: Try to extract from markdown code blocks first
+      const codeBlockMatch = planJson.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+      if (codeBlockMatch) {
+        cleanJson = codeBlockMatch[1].trim();
+      }
+
+      // Approach 2: If no code block or empty, try to find bare JSON object
+      if (!cleanJson) {
+        const jsonMatch = planJson.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          cleanJson = jsonMatch[0];
+        }
+      }
+
+      if (!cleanJson) {
         throw new Error('No JSON object found in director output');
       }
 
-      let cleanJson = jsonMatch[0];
-      // Remove markdown code blocks if present
-      cleanJson = cleanJson.replace(/```json?\n?/g, '').replace(/```\n?/g, '');
+      // Final cleanup - remove any remaining markdown artifacts
+      cleanJson = cleanJson.replace(/```json?\n?/g, '').replace(/```\n?/g, '').trim();
 
       const parsed = JSON.parse(cleanJson);
 
@@ -848,7 +862,8 @@ ${assignment.acceptance}
 2. Make the code changes
 3. Test your changes if possible
 4. Commit: git add . && git commit -m "feat: <description>"
-5. Push: git push origin ${assignment.em}
+5. Fetch latest: git fetch origin main && git rebase origin/main (resolve any conflicts)
+6. Push: git push origin ${assignment.em}
 
 **START IMPLEMENTING NOW.**
 `;
@@ -937,12 +952,22 @@ ${assignment.acceptance}
       }
     }
 
-    // Push final result
+    // Push final result - pull first to prevent rejection
     try {
+      // Fetch and rebase to get any remote changes
+      await this.runGit(['fetch', 'origin', 'main'], this.repoPath!, { ignoreError: true });
+      await this.runGit(['rebase', 'origin/main'], this.repoPath!, { ignoreError: true });
       await this.runGit(['push', 'origin', 'main'], this.repoPath!);
       logger.info(`[Iteration ${iteration}] Pushed merged result to origin`);
     } catch (error) {
-      logger.error(`[Iteration ${iteration}] Failed to push to origin`, { error });
+      // If push still fails, try pull --rebase then push again
+      try {
+        await this.runGit(['pull', '--rebase', 'origin', 'main'], this.repoPath!);
+        await this.runGit(['push', 'origin', 'main'], this.repoPath!);
+        logger.info(`[Iteration ${iteration}] Pushed merged result to origin (after pull)`);
+      } catch (retryError) {
+        logger.error(`[Iteration ${iteration}] Failed to push to origin`, { error: retryError });
+      }
     }
 
     logger.info(`[Iteration ${iteration}] Complete`, {

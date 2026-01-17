@@ -8,7 +8,7 @@
 import { EventEmitter } from 'events';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import {
   query,
@@ -226,14 +226,21 @@ export class SessionManager extends EventEmitter {
       model: options.model ? this.getFullModelName(options.model) : undefined,
       // Custom spawner that ensures node is in PATH (fixes Volta/nvm ENOENT issues)
       spawnClaudeCodeProcess: (spawnOpts: SpawnOptions): SpawnedProcess => {
-        // Ensure node's bin directory is at the front of PATH
-        const nodeBinDir = process.execPath.replace(/\/node$/, '');
+        // Use the absolute path to node instead of relying on PATH
+        const nodeAbsPath = process.execPath;
+        const nodeBinDir = nodeAbsPath.replace(/\/node$/, '');
+        const voltaShimDir = process.env.VOLTA_HOME ? `${process.env.VOLTA_HOME}/bin` : '';
         const env = {
+          ...process.env,
           ...spawnOpts.env,
-          PATH: `${nodeBinDir}:${spawnOpts.env.PATH || process.env.PATH}`,
+          PATH: `${nodeBinDir}:${voltaShimDir}:${spawnOpts.env?.PATH || process.env.PATH}`,
         };
-        const child = spawn(spawnOpts.command, spawnOpts.args, {
-          cwd: spawnOpts.cwd,
+        // Replace 'node' command with absolute path
+        const command = spawnOpts.command === 'node' ? nodeAbsPath : spawnOpts.command;
+        // Resolve cwd to absolute path
+        const cwd = spawnOpts.cwd ? resolve(spawnOpts.cwd) : process.cwd();
+        const child = spawn(command, spawnOpts.args, {
+          cwd,
           env,
           stdio: ['pipe', 'pipe', 'inherit'],
         });

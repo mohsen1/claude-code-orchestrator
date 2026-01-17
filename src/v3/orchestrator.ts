@@ -6,7 +6,7 @@
  */
 
 import { EventEmitter } from 'events';
-import { join, dirname } from 'path';
+import { join, dirname, resolve } from 'path';
 import { existsSync } from 'fs';
 import { mkdir, readFile, writeFile, rm } from 'fs/promises';
 import { SessionManager, type SessionManagerConfig } from './session-manager.js';
@@ -468,7 +468,8 @@ export class OrchestratorV3 extends EventEmitter {
   }
 
   private async createWorktree(name: string): Promise<string> {
-    const worktreePath = join(this.config.workspaceDir, 'worktrees', name);
+    // Use absolute path to avoid git interpreting it relative to repo directory
+    const worktreePath = resolve(join(this.config.workspaceDir, 'worktrees', name));
 
     if (existsSync(worktreePath)) {
       // Worktree exists, just return the path

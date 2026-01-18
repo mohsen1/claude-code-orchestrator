@@ -1,8 +1,5 @@
 # `cco`  Claude Code Orchestrator
 
-> [!NOTE]
-> This project is in early development and is not published to npm yet.
-
 Orchestrate multiple Claude Code instances to work collaboratively on software projects using the **Claude Agent SDK**. This is intended for **very long horizon tasks** that require parallelization and coordination among AI agents. Tasks like building a full-stack application, refactoring a large codebase, or implementing complex features.
 
 `cco` is designed to be completely hands-off once started, with automatic management of git branches, worktrees, and Claude sessions. The only requirement is to provide high-level project goals in `PROJECT_DIRECTION.md`.

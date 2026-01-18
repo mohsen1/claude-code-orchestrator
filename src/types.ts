@@ -31,9 +31,11 @@ export interface OrchestratorConfig {
   /** If true, creates a unique run branch instead of committing directly to branch */
   useRunBranch?: boolean;
 
-  // Team structure - simplified
-  /** Number of parallel workers (each gets a worktree) */
+  // Team structure - hierarchical
+  /** Total number of workers across all clusters */
   workerCount: number;
+  /** Workers per Tech Lead (creates hierarchical model if > 1) */
+  groupSize?: number;
 
   // Project definition
   projectDirection: string; // Overall goal (from PROJECT_DIRECTION.md or inline)
@@ -66,8 +68,8 @@ export interface OrchestratorConfig {
 // Session Types
 // ─────────────────────────────────────────────────────────────
 
-/** Simplified roles: Lead coordinates, Workers implement */
-export type SessionRole = 'lead' | 'worker';
+/** Hierarchical roles: Architect coordinates, Tech Leads manage features, Workers implement */
+export type SessionRole = 'architect' | 'tech-lead' | 'worker';
 
 export type SessionStatus =
   | 'idle'
@@ -189,16 +191,25 @@ export interface TaskResult {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Team Structure Types - Simplified
+// Team Structure Types - Hierarchical Cluster Model
 // ─────────────────────────────────────────────────────────────
 
-/** Simple Lead + Workers structure */
-export interface TeamStructure {
-  /** Lead session (runs in main repo, read-only) */
+/** A cluster of sessions working on a feature branch */
+export interface TeamCluster {
+  /** Tech Lead session (manages feature branch, read-only access) */
   lead: Session;
-
-  /** Worker sessions (each has a worktree) */
+  /** Feature branch name (e.g., 'feat/auth') */
+  featureBranch: string;
+  /** Worker sessions (each has a worktree off the feature branch) */
   workers: Session[];
+}
+
+/** Hierarchical team structure for scalable parallel development */
+export interface TeamStructure {
+  /** Architect session (runs on main branch, coordinates feature branches) */
+  architect: Session;
+  /** Feature clusters, each with a Tech Lead and Workers */
+  clusters: TeamCluster[];
 }
 
 // ─────────────────────────────────────────────────────────────

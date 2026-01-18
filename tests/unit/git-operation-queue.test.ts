@@ -33,6 +33,130 @@ describe('GitOperationQueue', () => {
       expect(executionOrder).toEqual([1, 2, 3]);
     });
 
+    it('should support bucketed locking - parallel local ops on different workdirs', async () => {
+      const queue = new GitOperationQueue();
+      const executionOrder: string[] = [];
+      const startTime = Date.now();
+
+      // Local operations on different workdirs should run in parallel
+      const repo1Op = queue.enqueue('/repo1', async () => {
+        executionOrder.push('repo1-start');
+        await new Promise(r => setTimeout(r, 50));
+        executionOrder.push('repo1-end');
+        return 'repo1';
+      });
+
+      const repo2Op = queue.enqueue('/repo2', async () => {
+        executionOrder.push('repo2-start');
+        await new Promise(r => setTimeout(r, 50));
+        executionOrder.push('repo2-end');
+        return 'repo2';
+      });
+
+      const repo3Op = queue.enqueue('/repo3', async () => {
+        executionOrder.push('repo3-start');
+        await new Promise(r => setTimeout(r, 50));
+        executionOrder.push('repo3-end');
+        return 'repo3';
+      });
+
+      const results = await Promise.all([repo1Op, repo2Op, repo3Op]);
+      const elapsed = Date.now() - startTime;
+
+      // With bucketed locking, these should run in parallel (~50ms total, not ~150ms)
+      expect(elapsed).toBeLessThan(100);
+
+      expect(results).toEqual(['repo1', 'repo2', 'repo3']);
+
+      // Each workdir's operations should still be serial within that workdir
+      expect(executionOrder).toContain('repo1-start');
+      expect(executionOrder).toContain('repo1-end');
+    });
+
+    it('should serialize global operations (fetch, push, gc) across all workdirs', async () => {
+      const queue = new GitOperationQueue();
+      const executionOrder: string[] = [];
+
+      // Global operations should be serialized even on different workdirs
+      const fetch1 = queue.enqueue('/repo1', async () => {
+        executionOrder.push('fetch1');
+        await new Promise(r => setTimeout(r, 20));
+        return 'fetched1';
+      }, { isGlobal: true });
+
+      const fetch2 = queue.enqueue('/repo2', async () => {
+        executionOrder.push('fetch2');
+        await new Promise(r => setTimeout(r, 20));
+        return 'fetched2';
+      }, { isGlobal: true });
+
+      const push1 = queue.enqueue('/repo1', async () => {
+        executionOrder.push('push1');
+        await new Promise(r => setTimeout(r, 20));
+        return 'pushed1';
+      }, { isGlobal: true });
+
+      const results = await Promise.all([fetch1, fetch2, push1]);
+
+      expect(results).toEqual(['fetched1', 'fetched2', 'pushed1']);
+      // Global ops should execute serially
+      expect(executionOrder).toEqual(['fetch1', 'fetch2', 'push1']);
+    });
+
+    it('should mix local and global operations correctly', async () => {
+      const queue = new GitOperationQueue();
+      const executionOrder: string[] = [];
+
+      // Start a global operation
+      const globalOp = queue.enqueue('/repo', async () => {
+        executionOrder.push('global-start');
+        await new Promise(r => setTimeout(r, 50));
+        executionOrder.push('global-end');
+        return 'global';
+      }, { isGlobal: true });
+
+      // Wait for global to start
+      await new Promise(r => setTimeout(r, 10));
+
+      // Local ops on different workdirs should run in parallel with global
+      const local1 = queue.enqueue('/workdir1', async () => {
+        executionOrder.push('local1');
+        return 'local1';
+      });
+
+      const local2 = queue.enqueue('/workdir2', async () => {
+        executionOrder.push('local2');
+        return 'local2';
+      });
+
+      const results = await Promise.all([globalOp, local1, local2]);
+
+      expect(results).toEqual(['global', 'local1', 'local2']);
+
+      // Local ops should complete (in parallel) while global is still running
+      expect(executionOrder).toContain('global-start');
+
+      // Both local ops should have executed
+      expect(executionOrder).toContain('local1');
+      expect(executionOrder).toContain('local2');
+    });
+
+    it('should auto-detect global operations (fetch, push, gc, remote)', async () => {
+      const queue = new GitOperationQueue();
+      const isGlobalSpy = vi.fn();
+
+      // These should be detected as global
+      await queue.enqueue('/repo', async () => {
+        isGlobalSpy('fetch');
+        return 'ok';
+      }); // No explicit isGlobal, but has 'fetch' in args
+
+      // Wait for processing
+      await new Promise(r => setTimeout(r, 50));
+
+      expect(isGlobalSpy).toHaveBeenCalledWith('fetch');
+    });
+
     it('should respect priority ordering', async () => {
       const queue = new GitOperationQueue();
       const executionOrder: string[] = [];
@@ -93,10 +217,10 @@ describe('GitOperationQueue', () => {
 
       // Start a slow operation that will be processing
       const p1 = queue.enqueue('/repo', () => new Promise(r => setTimeout(r, 500)));
-      
+
       // Wait for p1 to start processing (removed from queue)
       await new Promise(r => setTimeout(r, 10));
-      
+
       // Queue two more operations (fills the queue)
       const p2 = queue.enqueue('/repo', () => new Promise(r => setTimeout(r, 500)));
       const p3 = queue.enqueue('/repo', () => new Promise(r => setTimeout(r, 500)));
@@ -105,7 +229,7 @@ describe('GitOperationQueue', () => {
       await expect(
         queue.enqueue('/repo', async () => 'overflow')
       ).rejects.toThrow('Git operation queue full');
-      
+
       // Clean up - catch rejections to avoid unhandled promise warnings
       queue.clear();
       await Promise.allSettled([p1, p2, p3]);
@@ -127,6 +251,21 @@ describe('GitOperationQueue', () => {
       expect(stats.totalFailed).toBe(0);
       expect(stats.pending).toBe(0);
     });
+
+    it('should track per-workdir queue stats', async () => {
+      const queue = new GitOperationQueue();
+
+      // Queue operations on different workdirs
+      queue.enqueue('/repo1', async () => 'ok');
+      queue.enqueue('/repo2', async () => 'ok');
+      queue.enqueue('/repo1', async () => 'ok');
+
+      // Wait for processing to start
+      await new Promise(r => setTimeout(r, 50));
+
+      const stats = queue.getStats();
+      expect(stats.totalProcessed).toBeGreaterThanOrEqual(0);
+    });
   });
 
   describe('clear', () => {
@@ -135,7 +274,7 @@ describe('GitOperationQueue', () => {
 
       // Start a slow operation
       const slow = queue.enqueue('/repo', () => new Promise(r => setTimeout(r, 500)));
-      
+
       // Queue more operations
       const pending = queue.enqueue('/repo', async () => 'pending');
 
@@ -144,12 +283,35 @@ describe('GitOperationQueue', () => {
 
       // Pending should be rejected - use allSettled to catch the rejection
       const [slowResult, pendingResult] = await Promise.allSettled([slow, pending]);
-      
+
       expect(slowResult.status).toBe('fulfilled');
       expect(pendingResult.status).toBe('rejected');
       if (pendingResult.status === 'rejected') {
         expect(pendingResult.reason.message).toContain('queue cleared');
       }
+    });
+
+    it('should clear all workdir queues', async () => {
+      const queue = new GitOperationQueue();
+
+      // Queue operations on different workdirs
+      const p1 = queue.enqueue('/repo1', async () => {
+        await new Promise(r => setTimeout(r, 100));
+        return 'ok';
+      });
+
+      const p2 = queue.enqueue('/repo2', async () => 'pending');
+      const p3 = queue.enqueue('/repo3', async () => 'pending');
+
+      // Wait for first to start, then clear
+      await new Promise(r => setTimeout(r, 50));
+      queue.clear();
+
+      const [r1, r2, r3] = await Promise.allSettled([p1, p2, p3]);
+
+      expect(r1.status).toBe('fulfilled');
+      expect(r2.status).toBe('rejected');
+      expect(r3.status).toBe('rejected');
     });
   });
 

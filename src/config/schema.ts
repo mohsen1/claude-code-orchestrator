@@ -6,9 +6,14 @@ const gitUrlPattern = /^(https?:\/\/|git@)[^\s]+$/;
 /**
  * Orchestrator Configuration Schema
  *
- * Simplified Lead/Worker architecture.
- * - Lead: coordinates work, read-only access to main repo
- * - Workers: parallel implementers, each with own worktree
+ * Hierarchical Cluster architecture:
+ * - Architect: coordinates on main branch
+ * - Tech Leads: manage feature branches
+ * - Workers: implement in parallel, each with own worktree
+ *
+ * When groupSize is set, creates hierarchical model:
+ * - workerCount: total workers across all clusters
+ * - groupSize: workers per Tech Lead (e.g., 20 workers / size 5 = 4 Tech Leads)
  */
 export const OrchestratorConfigSchema = z
   .object({
@@ -26,7 +31,8 @@ export const OrchestratorConfigSchema = z
     localRepoPath: z.string().min(1).optional(), // Path to local repo to copy from (faster than cloning)
 
     // Worker settings
-    workerCount: z.number().int().min(1).max(50),
+    workerCount: z.number().int().min(1).max(100),
+    groupSize: z.number().int().min(1).max(10).optional(), // Workers per Tech Lead (creates hierarchy if set)
     model: z.enum(['opus', 'sonnet', 'haiku']).default('opus'), // Single model for all agents
 
     // Authentication
@@ -45,7 +51,6 @@ export const OrchestratorConfigSchema = z
     envFiles: z.array(z.string()).optional(), // Paths to env files to copy to each worker worktree
 
     // Legacy fields (for backward compatibility migration)
-    // These are used to calculate the new workerCount from old configs
     engineerManagerGroupSize: z.number().int().min(1).max(8).optional(),
 
     // Deprecated timing settings (kept for migration)
@@ -53,22 +58,18 @@ export const OrchestratorConfigSchema = z
     stuckThresholdMs: z.number().int().min(60000).optional(),
   })
   .transform((config) => {
-    // Migration: if old config has engineerManagerGroupSize, calculate actual workerCount
-    // Old: workerCount = conceptual workers, emGroupSize = workers per EM
-    // Old actual parallelism: ceil(workerCount / emGroupSize) = number of EMs
-    // New: workerCount = actual parallel workers (what were EMs)
-    let workerCount = config.workerCount;
+    // Handle legacy engineerManagerGroupSize - map to new groupSize
+    let groupSize = config.groupSize;
 
-    if (config.engineerManagerGroupSize !== undefined) {
-      const oldWorkerCount = config.workerCount;
-      const emGroupSize = config.engineerManagerGroupSize;
-      workerCount = Math.ceil(oldWorkerCount / emGroupSize);
+    if (config.engineerManagerGroupSize !== undefined && groupSize === undefined) {
+      // Old config: engineerManagerGroupSize means workers per EM
+      // New config: groupSize means workers per Tech Lead (same thing)
+      groupSize = config.engineerManagerGroupSize;
 
-      // Log deprecation warning (will be visible during config loading)
       console.warn(
-        `DEPRECATED: engineerManagerGroupSize is no longer used.\n` +
-          `Migrating: workerCount ${oldWorkerCount} / groupSize ${emGroupSize} = ${workerCount} parallel workers.\n` +
-          `Update your config to: { "workerCount": ${workerCount} }`
+        `DEPRECATED: engineerManagerGroupSize is now groupSize.\n` +
+          `Migrating: groupSize = ${groupSize}.\n` +
+          `Update your config to: { "workerCount": ${config.workerCount}, "groupSize": ${groupSize} }`
       );
     }
 
@@ -87,7 +88,8 @@ export const OrchestratorConfigSchema = z
       workspaceDir: config.workspaceDir,
       logDirectory: config.logDirectory,
       localRepoPath: config.localRepoPath,
-      workerCount,
+      workerCount: config.workerCount,
+      groupSize,
       model: config.model,
       authMode: config.authMode,
       taskTimeoutMs,

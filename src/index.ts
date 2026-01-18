@@ -15,8 +15,9 @@ export { SessionManager, type SessionManagerConfig } from './session-manager.js'
 
 // Agent definitions
 export {
+  createArchitectAgent,
+  createTechLeadAgent,
   createWorkerAgent,
-  createLeadAgent,
   createWorkerAgents,
   TOOL_SETS,
   type AgentDefinition,
@@ -62,6 +63,7 @@ export type {
 
   // Team structure
   TeamStructure,
+  TeamCluster,
 
   // Events
   OrchestratorEvent,

@@ -21,14 +21,23 @@ export interface GitQueueStats {
 
 /**
  * Serializes git operations to prevent lock contention when using worktrees.
- * 
- * Git worktrees share the .git directory, so concurrent git operations
- * can fail with "index.lock" errors. This queue ensures only one git
- * operation runs at a time across all worktrees.
+ *
+ * With bucketed locking:
+ * - Each workDir has its own queue (local operations can run in parallel)
+ * - Global operations (fetch, push, gc) use a global lock
+ *
+ * Git worktrees share the .git/objects directory, but index.lock is per-worktree.
+ * Only fetch/push/gc need global locking. Local operations (add, commit, status) can
+ * run in parallel across different worktrees.
  */
 export class GitOperationQueue {
-  private queue: QueuedGitOperation[] = [];
-  private processing = false;
+  // Per-workdir queues: map of workDir -> queue
+  private workdirQueues: Map<string, QueuedGitOperation[]> = new Map();
+  // Global queue for operations that must run serially across everything
+  private globalQueue: QueuedGitOperation[] = [];
+
+  private processingWorkdir = new Set<string>();
+  private processingGlobal = false;
   private operationId = 0;
   private stats = {
     totalProcessed: 0,
@@ -56,19 +65,27 @@ export class GitOperationQueue {
 
   /**
    * Queue a git operation for execution.
-   * Returns a promise that resolves when the operation completes.
+   *
+   * @param workDir - The working directory for the git operation
+   * @param operation - The async operation to execute
+   * @param options.isGlobal - If true, uses global lock (for fetch, push, gc)
+   * @param options.priority - Priority for queue ordering
+   * @param options.label - Optional label for logging
    */
   async enqueue<T>(
     workDir: string,
     operation: () => Promise<T>,
-    options: { priority?: 'high' | 'normal' | 'low'; label?: string } = {}
+    options: { isGlobal?: boolean; priority?: 'high' | 'normal' | 'low'; label?: string } = {}
   ): Promise<T> {
-    if (this.queue.length >= this.maxQueueSize) {
-      throw new Error(`Git operation queue full (max ${this.maxQueueSize})`);
+    const { isGlobal = false, priority = 'normal', label } = options;
+
+    const targetQueue = isGlobal ? this.globalQueue : this.getWorkdirQueue(workDir);
+
+    if (targetQueue.length >= this.maxQueueSize) {
+      throw new Error(`Git operation queue full (max ${this.maxQueueSize}) for ${isGlobal ? 'global' : workDir}`);
     }
 
     const id = `git-op-${++this.operationId}`;
-    const priority = options.priority ?? 'normal';
 
     return new Promise<T>((resolve, reject) => {
       const queuedOp: QueuedGitOperation<T> = {
@@ -82,109 +99,155 @@ export class GitOperationQueue {
       };
 
       // Insert based on priority
-      if (priority === 'high') {
-        // Find first non-high priority item
-        const insertIndex = this.queue.findIndex(op => op.priority !== 'high');
-        if (insertIndex === -1) {
-          this.queue.push(queuedOp as QueuedGitOperation);
-        } else {
-          this.queue.splice(insertIndex, 0, queuedOp as QueuedGitOperation);
-        }
-      } else if (priority === 'low') {
-        this.queue.push(queuedOp as QueuedGitOperation);
-      } else {
-        // Normal priority: insert after high, before low
-        const insertIndex = this.queue.findIndex(op => op.priority === 'low');
-        if (insertIndex === -1) {
-          this.queue.push(queuedOp as QueuedGitOperation);
-        } else {
-          this.queue.splice(insertIndex, 0, queuedOp as QueuedGitOperation);
-        }
-      }
+      this.insertByPriority(targetQueue, queuedOp as QueuedGitOperation<unknown>, priority);
 
       logger.debug('Git operation queued', {
         id,
         workDir,
+        isGlobal,
         priority,
-        label: options.label,
-        queueLength: this.queue.length,
+        label,
+        queueLength: targetQueue.length,
       });
 
-      this.processQueue();
+      if (isGlobal) {
+        this.processGlobalQueue();
+      } else {
+        this.processWorkdirQueue(workDir);
+      }
     });
   }
 
+  private getWorkdirQueue(workDir: string): QueuedGitOperation[] {
+    if (!this.workdirQueues.has(workDir)) {
+      this.workdirQueues.set(workDir, []);
+    }
+    return this.workdirQueues.get(workDir)!;
+  }
+
+  private insertByPriority(queue: QueuedGitOperation[], op: QueuedGitOperation, priority: string): void {
+    if (priority === 'high') {
+      // Find first non-high priority item
+      const insertIndex = queue.findIndex(q => q.priority !== 'high');
+      if (insertIndex === -1) {
+        queue.push(op);
+      } else {
+        queue.splice(insertIndex, 0, op);
+      }
+    } else if (priority === 'low') {
+      queue.push(op);
+    } else {
+      // Normal priority: insert after high, before low
+      const insertIndex = queue.findIndex(q => q.priority === 'low');
+      if (insertIndex === -1) {
+        queue.push(op);
+      } else {
+        queue.splice(insertIndex, 0, op);
+      }
+    }
+  }
+
   /**
-   * Process the queue serially.
+   * Process a workdir's queue serially.
    */
-  private async processQueue(): Promise<void> {
-    if (this.processing || this.queue.length === 0) {
+  private async processWorkdirQueue(workDir: string): Promise<void> {
+    if (this.processingWorkdir.has(workDir)) {
       return;
     }
 
-    this.processing = true;
-
-    while (this.queue.length > 0) {
-      const op = this.queue.shift()!;
-      const waitMs = Date.now() - op.createdAt;
-
-      logger.debug('Processing git operation', {
-        id: op.id,
-        workDir: op.workDir,
-        waitMs,
-        remainingQueue: this.queue.length,
-      });
-
-      const startTime = Date.now();
-      let lastError: Error | null = null;
-
-      for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-        try {
-          const result = await this.executeWithTimeout(op.operation);
-          const processMs = Date.now() - startTime;
-
-          this.stats.totalProcessed++;
-          this.stats.totalWaitMs += waitMs;
-          this.stats.totalProcessMs += processMs;
-
-          logger.debug('Git operation completed', {
-            id: op.id,
-            attempt,
-            processMs,
-          });
-
-          op.resolve(result);
-          lastError = null;
-          break;
-        } catch (err) {
-          lastError = err instanceof Error ? err : new Error(String(err));
-
-          if (attempt < this.maxRetries && this.isRetryableError(lastError)) {
-            logger.warn('Git operation failed, retrying', {
-              id: op.id,
-              attempt,
-              maxRetries: this.maxRetries,
-              error: lastError.message,
-            });
-            await this.delay(this.retryDelayMs * attempt);
-          }
-        }
-      }
-
-      if (lastError) {
-        this.stats.totalFailed++;
-        logger.error('Git operation failed permanently', {
-          id: op.id,
-          error: lastError.message,
-        });
-        op.reject(lastError);
-      }
-
-      // Small delay between operations to let git release resources
-      await this.delay(50);
+    const queue = this.getWorkdirQueue(workDir);
+    if (queue.length === 0) {
+      return;
     }
 
-    this.processing = false;
+    this.processingWorkdir.add(workDir);
+
+    try {
+      while (queue.length > 0) {
+        const op = queue.shift()!;
+        await this.executeOperation(op);
+      }
+    } finally {
+      this.processingWorkdir.delete(workDir);
+    }
+  }
+
+  /**
+   * Process the global queue serially.
+   */
+  private async processGlobalQueue(): Promise<void> {
+    if (this.processingGlobal || this.globalQueue.length === 0) {
+      return;
+    }
+
+    this.processingGlobal = true;
+
+    try {
+      while (this.globalQueue.length > 0) {
+        const op = this.globalQueue.shift()!;
+        await this.executeOperation(op);
+      }
+    } finally {
+      this.processingGlobal = false;
+    }
+  }
+
+  private async executeOperation(op: QueuedGitOperation): Promise<void> {
+    const waitMs = Date.now() - op.createdAt;
+
+    logger.debug('Processing git operation', {
+      id: op.id,
+      workDir: op.workDir,
+      waitMs,
+    });
+
+    const startTime = Date.now();
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        const result = await this.executeWithTimeout(op.operation);
+        const processMs = Date.now() - startTime;
+
+        this.stats.totalProcessed++;
+        this.stats.totalWaitMs += waitMs;
+        this.stats.totalProcessMs += processMs;
+
+        logger.debug('Git operation completed', {
+          id: op.id,
+          attempt,
+          processMs,
+        });
+
+        op.resolve(result);
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+
+        if (attempt < this.maxRetries && this.isRetryableError(lastError)) {
+          logger.warn('Git operation failed, retrying', {
+            id: op.id,
+            attempt,
+            maxRetries: this.maxRetries,
+            error: lastError.message,
+          });
+          await this.delay(this.retryDelayMs * attempt);
+        }
+      }
+    }
+
+    if (lastError) {
+      this.stats.totalFailed++;
+      logger.error('Git operation failed permanently', {
+        id: op.id,
+        error: lastError.message,
+      });
+      op.reject(lastError);
+    }
+
+    // Small delay between operations to let git release resources
+    await this.delay(50);
   }
 
   private async executeWithTimeout<T>(operation: () => Promise<T>): Promise<T> {
@@ -219,10 +282,13 @@ export class GitOperationQueue {
    * Get queue statistics.
    */
   getStats(): GitQueueStats {
+    const totalPending = this.globalQueue.length +
+      Array.from(this.workdirQueues.values()).reduce((sum, q) => sum + q.length, 0);
+
     const processed = this.stats.totalProcessed || 1;
     return {
-      pending: this.queue.length,
-      processing: this.processing,
+      pending: totalPending,
+      processing: this.processingGlobal || this.processingWorkdir.size > 0,
       totalProcessed: this.stats.totalProcessed,
       totalFailed: this.stats.totalFailed,
       avgWaitMs: Math.round(this.stats.totalWaitMs / processed),
@@ -234,11 +300,24 @@ export class GitOperationQueue {
    * Clear pending operations (doesn't affect currently running operation).
    */
   clear(): void {
-    const cleared = this.queue.length;
-    for (const op of this.queue) {
+    let cleared = 0;
+
+    // Clear global queue
+    for (const op of this.globalQueue) {
       op.reject(new Error('Git operation queue cleared'));
     }
-    this.queue = [];
+    cleared += this.globalQueue.length;
+    this.globalQueue = [];
+
+    // Clear all workdir queues
+    for (const [workDir, queue] of this.workdirQueues.entries()) {
+      for (const op of queue) {
+        op.reject(new Error('Git operation queue cleared'));
+      }
+      cleared += queue.length;
+      this.workdirQueues.set(workDir, []);
+    }
+
     logger.info('Git operation queue cleared', { cleared });
   }
 
@@ -246,7 +325,8 @@ export class GitOperationQueue {
    * Get current queue length.
    */
   get length(): number {
-    return this.queue.length;
+    return this.globalQueue.length +
+      Array.from(this.workdirQueues.values()).reduce((sum, q) => sum + q.length, 0);
   }
 }
 

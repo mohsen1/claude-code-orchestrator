@@ -1,8 +1,9 @@
 /**
  * Agent Definitions
  *
- * Simplified Lead/Worker architecture:
- * - Lead: Coordinates work, read-only access to main repo
+ * Hierarchical Cluster architecture:
+ * - Architect: Coordinates feature branches on main
+ * - Tech Leads: Manage workers and merge to feature branches
  * - Workers: Parallel implementers, each with own worktree
  */
 
@@ -16,7 +17,13 @@ export type { AgentDefinition };
 // ─────────────────────────────────────────────────────────────
 
 export const TOOL_SETS = {
-  /** Read-only tools for Lead (prevents git index locks in main repo) */
+  /** Read-only tools for Architect (prevents git index locks in main repo) */
+  architect: ['Read', 'Glob', 'Grep', 'Task'] as string[],
+
+  /** Read-only tools for Tech Leads (prevents git index locks in feature branch) */
+  techLead: ['Read', 'Glob', 'Grep', 'Task'] as string[],
+
+  /** Read-only tools for Lead (flat model, prevents git index locks in main repo) */
   lead: ['Read', 'Glob', 'Grep', 'Task'] as string[],
 
   /** Full developer tools for Workers */
@@ -24,51 +31,138 @@ export const TOOL_SETS = {
 };
 
 // ─────────────────────────────────────────────────────────────
-// Lead Agent
+// Architect Agent (Hierarchical Model)
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Create the Lead agent definition
+ * Create the Architect agent definition
  *
- * Lead responsibilities:
- * - Reads PROJECT_DIRECTION.md to understand goals
- * - Explores codebase (can use Task subagents)
- * - Creates work assignments for workers
- * - Coordinates merges (orchestrator handles git commands)
- * - Reassigns work as workers complete
+ * Architect responsibilities:
+ * - Reads PROJECT_DIRECTION.md to understand overall goals
+ * - Identifies feature areas (epics) for Tech Leads
+ * - Creates feature branches and assigns them to Tech Leads
+ * - Monitors feature branch completion
+ * - Merges feature branches to main
  *
- * Lead runs in main repo with READ-ONLY tools to avoid git locks.
+ * Architect runs in main repo with READ-ONLY tools.
  */
-export function createLeadAgent(workerCount: number): AgentDefinition {
+export function createArchitectAgent(featureCount: number, totalWorkers: number): AgentDefinition {
   return {
-    description: `Lead: Creates work plan and coordinates ${workerCount} workers.`,
-    prompt: `You are the Lead coordinating this software project.
+    description: `Architect: Coordinates ${featureCount} feature branches with ${totalWorkers} total workers.`,
+    prompt: `You are the Architect coordinating this software project across ${featureCount} feature branches.
 
 ## YOUR TASK
 
-Analyze the project and create a JSON work plan assigning tasks to your ${workerCount} Workers.
+Analyze the project and create a JSON plan assigning feature areas to your ${featureCount} Tech Leads.
 
 **YOU MUST OUTPUT ONLY A VALID JSON OBJECT. No other text.**
 
 ## Team Structure
-- ${workerCount} Workers: worker-1 through worker-${workerCount}
-- Each Worker has their own git worktree and branch
-- Workers implement code directly (no documentation)
-- Workers run in parallel
+- You are the Architect on the main branch
+- ${featureCount} Tech Leads: lead-1 through lead-${featureCount}
+- Each Tech Lead manages a feature branch
+- ${totalWorkers} total Workers are distributed across feature branches
+- Tech Leads coordinate their Workers and merge to their feature branch
+- You merge completed feature branches to main
 
 ## Your Tools
 - Read, Glob, Grep: Explore the codebase
 - Task: Spawn subagents for parallel exploration tasks
 
 **IMPORTANT**: You have READ-ONLY access to the repository. You cannot edit files.
-Your job is to analyze and create work assignments. Workers will implement the code.
+Your job is to analyze and create feature branch assignments.
 
 ## Instructions
 
 1. Read PROJECT_DIRECTION.md to understand what needs to be done
 2. Explore the codebase to understand the current state
-3. Identify ${workerCount} distinct work areas that can be done in parallel
-4. Output a JSON plan assigning each area to a Worker
+3. Identify ${featureCount} distinct feature areas that can be developed independently
+4. Output a JSON plan assigning each feature area to a Tech Lead
+
+## Required JSON Output Format
+
+You MUST output ONLY this JSON structure (no markdown, no explanation):
+
+{
+  "features": [
+    {
+      "lead": "lead-1",
+      "featureBranch": "feat/feature-name",
+      "area": "Brief description of the feature/epic",
+      "files": ["list", "of", "key", "files", "to", "modify"],
+      "workerCount": 5,
+      "goals": ["specific goal 1", "specific goal 2"]
+    },
+    {
+      "lead": "lead-2",
+      "featureBranch": "feat/another-feature",
+      "area": "...",
+      "files": ["..."],
+      "workerCount": 5,
+      "goals": ["..."]
+    }
+  ]
+}
+
+## Rules
+
+- Output ONLY valid JSON - no markdown code blocks, no explanations
+- Each Tech Lead should have an independent feature area (no dependencies)
+- Feature branch names should be short and descriptive (e.g., feat/auth, feat/ui)
+- Distribute workers evenly across feature branches
+- Focus on CODE implementation, not documentation
+- Be specific about which files to modify
+
+**OUTPUT THE JSON NOW. Nothing else.**`,
+    tools: TOOL_SETS.architect,
+    model: 'opus',
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tech Lead Agent (Hierarchical Model)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Create a Tech Lead agent definition
+ *
+ * Tech Lead responsibilities:
+ * - Receives feature assignment from Architect
+ * - Creates work assignments for their Workers
+ * - Coordinates worker execution on their feature branch
+ * - Merges worker branches to feature branch
+ * - Reports completion when feature is ready
+ *
+ * Tech Lead runs in feature branch with READ-ONLY tools.
+ */
+export function createTechLeadAgent(
+  leadId: string,
+  featureBranch: string,
+  workerCount: number
+): AgentDefinition {
+  return {
+    description: `Tech Lead ${leadId}: Manages ${workerCount} workers on ${featureBranch}.`,
+    prompt: `You are ${leadId}, a Tech Lead managing ${workerCount} Workers on the "${featureBranch}" feature branch.
+
+## YOUR TASK
+
+Create a JSON work plan assigning tasks to your ${workerCount} Workers.
+
+**YOU MUST OUTPUT ONLY A VALID JSON OBJECT. No other text.**
+
+## Your Tools
+- Read, Glob, Grep: Explore the codebase
+- Task: Spawn subagents for parallel exploration tasks
+
+**IMPORTANT**: You have READ-ONLY access to the repository.
+Your Workers will implement the code. You coordinate and review.
+
+## Instructions
+
+1. Understand your assigned feature area
+2. Explore the relevant code
+3. Identify ${workerCount} distinct work items that can be done in parallel
+4. Output a JSON plan assigning each item to a Worker
 
 ## Required JSON Output Format
 
@@ -78,32 +172,24 @@ You MUST output ONLY this JSON structure (no markdown, no explanation):
   "assignments": [
     {
       "worker": "worker-1",
-      "area": "Brief description of the feature/area",
-      "files": ["list", "of", "key", "files", "to", "modify"],
-      "tasks": ["specific task 1", "specific task 2", "specific task 3"],
-      "acceptance": "How to verify this work is complete"
-    },
-    {
-      "worker": "worker-2",
-      "area": "...",
-      "files": ["..."],
-      "tasks": ["..."],
-      "acceptance": "..."
+      "area": "Brief description of the task",
+      "files": ["list", "of", "files"],
+      "tasks": ["specific task 1", "specific task 2"],
+      "acceptance": "How to verify completion"
     }
   ]
 }
 
 ## Rules
 
-- Output ONLY valid JSON - no markdown code blocks, no explanations
-- Each Worker should have independent work (no dependencies between Workers if possible)
-- Focus on CODE implementation, not documentation
-- Be specific about which files to modify
-- Include 2-4 concrete tasks per Worker
+- Output ONLY valid JSON - no markdown code blocks
+- Workers should have independent work within the feature
+- Focus on CODE implementation
+- Be specific about files and tasks
 
 **OUTPUT THE JSON NOW. Nothing else.**`,
-    tools: TOOL_SETS.lead,
-    model: 'opus',
+    tools: TOOL_SETS.techLead,
+    model: 'sonnet',
   };
 }
 

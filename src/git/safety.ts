@@ -18,6 +18,8 @@ export interface GitRunOptions {
   skipQueue?: boolean;
   /** Priority for queued operations */
   priority?: 'high' | 'normal' | 'low';
+  /** Use global lock (for fetch, push, gc - operations that affect the whole repo) */
+  isGlobal?: boolean;
 }
 
 type GitRunResult = Awaited<ReturnType<typeof execa>>;
@@ -151,10 +153,14 @@ async function runGitImmediate(
 
 /**
  * Run a git command, serialized through the operation queue to prevent lock contention.
- * 
+ *
  * With 14+ workers using worktrees, concurrent git operations can fail due to
  * .git/index.lock conflicts. This function queues operations to run serially.
- * 
+ *
+ * With bucketed locking:
+ * - Local operations (add, commit, status, diff) run in parallel per workdir
+ * - Global operations (fetch, push, gc) use a global lock
+ *
  * Use `skipQueue: true` only for read-only commands that don't touch the index.
  */
 export async function runGit(
@@ -165,7 +171,11 @@ export async function runGit(
   // Some commands are safe to run concurrently (read-only)
   const safeCommands = ['rev-parse', 'branch', '--show-current', 'log', 'diff', 'show', 'ls-tree', 'cat-file'];
   const isSafeCommand = safeCommands.some(cmd => args.includes(cmd)) && !args.includes('checkout');
-  
+
+  // Auto-detect global operations (fetch, push, gc, remote operations)
+  const globalCommands = ['fetch', 'push', 'gc', 'remote'];
+  const isGlobalOperation = options.isGlobal ?? globalCommands.some(cmd => args.includes(cmd));
+
   if (options.skipQueue || isSafeCommand) {
     return runGitImmediate(workDir, args, options);
   }
@@ -175,6 +185,7 @@ export async function runGit(
     workDir,
     () => runGitImmediate(workDir, args, options),
     {
+      isGlobal: isGlobalOperation,
       priority: options.priority ?? 'normal',
       label: args.slice(0, 3).join(' '),
     }

@@ -9,10 +9,11 @@
 import { EventEmitter } from 'events';
 import { join, dirname, resolve } from 'path';
 import { existsSync } from 'fs';
-import { mkdir, readFile } from 'fs/promises';
+import { mkdir, readFile, rm } from 'fs/promises';
 import { SessionManager, type SessionManagerConfig } from './session-manager.js';
 import {
-  createLeadAgent,
+  createArchitectAgent,
+  createTechLeadAgent,
   createWorkerAgent,
   createWorkerAgents,
   type AgentDefinition,
@@ -26,6 +27,7 @@ import type {
   OrchestratorEvent,
   Session,
   TeamStructure,
+  TeamCluster,
   AuthConfig,
 } from './types.js';
 import { logger, configureLogDirectory } from './utils/logger.js';
@@ -41,7 +43,7 @@ const DEFAULT_CONFIG: Partial<OrchestratorConfig> = {
   permissionMode: 'bypassPermissions',
   taskTimeoutMs: 600000, // 10 minutes
   pollIntervalMs: 5000,
-  maxRunDurationMinutes: 120,
+  maxRunDurationMinutes: 480,
   authMode: 'oauth',
   auditLog: true,
   progressIntervalMs: 30000,
@@ -198,23 +200,23 @@ export class Orchestrator extends EventEmitter {
       throw new Error('No team structure - orchestrator not started');
     }
 
-    const leadSession = this.teamStructure.lead;
+    const architectSession = this.teamStructure.architect;
 
-    if (!leadSession) {
-      throw new Error('No lead session found');
+    if (!architectSession) {
+      throw new Error('No architect session found');
     }
 
     logger.info('Continuing orchestration with new prompt', {
-      sessionId: leadSession.id,
+      sessionId: architectSession.id,
       promptLength: prompt.length,
     });
 
     // Create worker agents for delegation
     const agents = createWorkerAgents(this.config.workerCount);
 
-    // Execute continuation on the lead session
+    // Execute continuation on the architect session
     for await (const message of this.sessionManager.executeTask(
-      leadSession.id,
+      architectSession.id,
       prompt,
       {
         allowedTools: ['Read', 'Glob', 'Grep', 'Task'],
@@ -222,7 +224,7 @@ export class Orchestrator extends EventEmitter {
         model: this.config.model,
       }
     )) {
-      this.handleMessage(leadSession.id, message);
+      this.handleMessage(architectSession.id, message);
     }
   }
 
@@ -333,27 +335,79 @@ export class Orchestrator extends EventEmitter {
     } else {
       // Clone
       logger.info('Cloning repository', { repositoryUrl, branch });
-      
-      // Build clone arguments - clone directly to target directory
-      const cloneArgs = ['clone', '--branch', branch];
-      const cloneOpts = this.config.gitCloneOptions;
-      if (cloneOpts?.depth) {
-        cloneArgs.push('--depth', String(cloneOpts.depth));
-      }
-      if (cloneOpts?.singleBranch) {
-        cloneArgs.push('--single-branch');
-      }
-      if (cloneOpts?.noSubmodules) {
-        cloneArgs.push('--no-recurse-submodules');
-      }
-      cloneArgs.push(repositoryUrl, this.repoPath);
 
-      // Clone from parent directory (no -C flag needed)
       const { execa } = await import('execa');
-      await execa('git', cloneArgs, { 
-        cwd: workspaceDir,
-        timeout: 300000 // 5 minutes for large repos
-      });
+
+      const cloneOpts = this.config.gitCloneOptions;
+      const buildCloneArgs = (usePartial: boolean): string[] => {
+        const args = [
+          '-c', 'http.lowSpeedLimit=0',
+          '-c', 'http.lowSpeedTime=999999',
+          '-c', 'http.postBuffer=524288000',
+          'clone',
+          '--branch',
+          branch,
+          '--no-tags',
+        ];
+        if (cloneOpts?.depth) {
+          args.push('--depth', String(cloneOpts.depth));
+        } else if (usePartial) {
+          // Shallow + partial clone fallback for large repos
+          args.push('--depth', '1');
+        }
+        if (cloneOpts?.singleBranch || usePartial) {
+          args.push('--single-branch');
+        }
+        if (cloneOpts?.noSubmodules) {
+          args.push('--no-recurse-submodules');
+        }
+        if (usePartial) {
+          args.push('--filter=blob:none');
+        }
+        args.push(repositoryUrl, this.repoPath!);
+        return args;
+      };
+
+      const attemptClone = async (usePartial: boolean, attempt: number): Promise<void> => {
+        logger.info('Cloning repository (attempt)', { attempt, usePartial });
+        try {
+          await execa('git', buildCloneArgs(usePartial), {
+            cwd: workspaceDir,
+            timeout: 900000, // 15 minutes for large repos
+            env: {
+              ...process.env,
+              GIT_TERMINAL_PROMPT: '0',
+              GIT_ASKPASS: '/usr/bin/true',
+              GIT_CREDENTIAL_HELPER: '',
+              GCM_INTERACTIVE: 'Never',
+              GIT_LFS_SKIP_SMUDGE: '1',
+            },
+          });
+        } catch (error) {
+          // Clean up partial clone directory before retry
+          if (existsSync(this.repoPath!)) {
+            await rm(this.repoPath!, { recursive: true, force: true });
+          }
+          throw error;
+        }
+      };
+
+      const preferPartial = !cloneOpts?.depth;
+      try {
+        await attemptClone(preferPartial, 1);
+        if (!preferPartial) {
+          return;
+        }
+      } catch (error) {
+        logger.warn('Clone failed, retrying with alternate mode', { error });
+        try {
+          await attemptClone(!preferPartial, 2);
+        } catch (error2) {
+          logger.warn('Clone retry failed, retrying once more', { error: error2 });
+          await this.sleep(5000);
+          await attemptClone(true, 3);
+        }
+      }
     }
 
     // Set up the work branch (either same as source branch, or a new run branch)
@@ -373,16 +427,119 @@ export class Orchestrator extends EventEmitter {
   }
 
   private async createTeamStructure(): Promise<void> {
+    const groupSize = this.config.groupSize;
+    const workerCount = this.config.workerCount;
+
+    // Determine if we should use hierarchical model
+    const useHierarchical = groupSize !== undefined && groupSize > 1 && workerCount > groupSize;
+
     logger.info('Creating team structure', {
-      workerCount: this.config.workerCount,
+      workerCount,
+      groupSize: groupSize || 'N/A (flat model)',
+      mode: useHierarchical ? 'hierarchical' : 'flat',
     });
 
-    // Create Lead session (runs in main repo with read-only tools)
-    let lead = this.sessionManager.getSession('lead');
-    if (!lead) {
-      lead = await this.sessionManager.createSession(
-        'lead',
-        'lead',
+    if (useHierarchical) {
+      // Hierarchical model: Architect → Tech Leads → Workers
+      await this.createHierarchicalTeamStructure(workerCount, groupSize!);
+    } else {
+      // Flat model: Lead → Workers
+      await this.createFlatTeamStructure(workerCount);
+    }
+  }
+
+  private async createHierarchicalTeamStructure(workerCount: number, groupSize: number): Promise<void> {
+    // Calculate number of clusters (Tech Leads)
+    const clusterCount = Math.ceil(workerCount / groupSize);
+    const clusters: TeamCluster[] = [];
+
+    // Create Architect session (runs in main repo with read-only tools)
+    let architect = this.sessionManager.getSession('architect');
+    if (!architect) {
+      architect = await this.sessionManager.createSession(
+        'architect',
+        'architect',
+        this.repoPath,
+        this.workBranch!
+      );
+    }
+
+    // Create Tech Lead sessions and their workers
+    for (let i = 0; i < clusterCount; i++) {
+      const leadId = `lead-${i + 1}`;
+      const workersInCluster = Math.min(groupSize, workerCount - i * groupSize);
+
+      // Create feature branch for this cluster
+      const featureBranch = `feat/cluster-${i + 1}`;
+
+      // Create Tech Lead session (runs in feature branch with read-only tools)
+      let techLead = this.sessionManager.getSession(leadId);
+      if (!techLead) {
+        // Create the feature branch first
+        await runGit(this.repoPath!, ['checkout', '-b', featureBranch, this.workBranch!], { allowFailure: true });
+        await runGit(this.repoPath!, ['push', '-u', 'origin', featureBranch], { allowFailure: true });
+        await runGit(this.repoPath!, ['checkout', this.workBranch!]);
+
+        // Create tech lead session on the feature branch
+        techLead = await this.sessionManager.createSession(
+          leadId,
+          'tech-lead',
+          this.repoPath,
+          featureBranch
+        );
+      }
+
+      // Create Worker sessions for this cluster
+      const workers: Session[] = [];
+      for (let j = 0; j < workersInCluster; j++) {
+        const workerNum = i * groupSize + j + 1;
+        const workerId = `worker-${workerNum}`;
+        let worker = this.sessionManager.getSession(workerId);
+        if (!worker) {
+          // Create worktree off the feature branch
+          const workerPath = await this.createWorktree(workerId, featureBranch);
+          worker = await this.sessionManager.createSession(
+            workerId,
+            'worker',
+            workerPath,
+            workerId
+          );
+        }
+        workers.push(worker);
+      }
+
+      clusters.push({
+        lead: techLead,
+        featureBranch,
+        workers,
+      });
+    }
+
+    this.teamStructure = {
+      architect,
+      clusters,
+    };
+
+    logger.info('Hierarchical team structure created', {
+      architect: architect.id,
+      clusters: clusters.map(c => ({
+        lead: c.lead.id,
+        featureBranch: c.featureBranch,
+        workers: c.workers.map(w => w.id),
+      })),
+    });
+  }
+
+  private async createFlatTeamStructure(workerCount: number): Promise<void> {
+    // For now, use a single cluster with the architect as the lead
+    // This allows backward compatibility while we transition
+
+    // Create Architect session (acts as lead in flat model)
+    let architect = this.sessionManager.getSession('architect');
+    if (!architect) {
+      architect = await this.sessionManager.createSession(
+        'architect',
+        'architect',
         this.repoPath,
         this.workBranch!
       );
@@ -390,11 +547,11 @@ export class Orchestrator extends EventEmitter {
 
     // Create Worker sessions (each has own worktree)
     const workers: Session[] = [];
-    for (let i = 1; i <= this.config.workerCount; i++) {
+    for (let i = 1; i <= workerCount; i++) {
       const workerId = `worker-${i}`;
       let worker = this.sessionManager.getSession(workerId);
       if (!worker) {
-        const workerPath = await this.createWorktree(workerId);
+        const workerPath = await this.createWorktree(workerId, this.workBranch!);
         worker = await this.sessionManager.createSession(
           workerId,
           'worker',
@@ -405,18 +562,25 @@ export class Orchestrator extends EventEmitter {
       workers.push(worker);
     }
 
+    // Create a single cluster
     this.teamStructure = {
-      lead,
-      workers,
+      architect,
+      clusters: [
+        {
+          lead: architect, // In flat mode, architect acts as the lead
+          featureBranch: this.workBranch!,
+          workers,
+        },
+      ],
     };
 
-    logger.info('Team structure created', {
-      lead: lead.id,
-      workers: workers.map(w => w.id),
+    logger.info('Flat team structure created', {
+      architect: architect.id,
+      workers: workers.map((w: Session) => w.id),
     });
   }
 
-  private async createWorktree(name: string): Promise<string> {
+  private async createWorktree(name: string, branch: string): Promise<string> {
     // Use absolute path to avoid git interpreting it relative to repo directory
     const worktreePath = resolve(join(this.config.workspaceDir, 'worktrees', name));
 
@@ -430,15 +594,15 @@ export class Orchestrator extends EventEmitter {
     await runGit(this.repoPath!, ['worktree', 'prune'], { allowFailure: true });
 
     // Create or checkout branch
-    await runGit(this.repoPath!, ['branch', name], { allowFailure: true });
+    await runGit(this.repoPath!, ['branch', name, branch], { allowFailure: true });
 
     // Create worktree (use -f to force if already registered)
     await runGit(this.repoPath!, ['worktree', 'add', '-f', worktreePath, name]);
 
-    // Push the worker branch to origin so it exists remotely
-    await runGit(this.repoPath!, ['push', '-u', 'origin', name], { allowFailure: true });
+    // NOTE: We don't push immediately to reduce remote noise
+    // Worker branches are pushed when they have actual commits
 
-    logger.info('Created worktree', { name, path: worktreePath });
+    logger.info('Created worktree', { name, path: worktreePath, fromBranch: branch });
 
     return worktreePath;
   }
@@ -450,6 +614,15 @@ export class Orchestrator extends EventEmitter {
   private async runOrchestration(): Promise<void> {
     // Read project direction
     const projectDirection = await this.loadProjectDirection();
+
+    // Determine if we should use hierarchical model
+    const clusterCount = this.teamStructure!.clusters.length;
+    const useHierarchical = clusterCount > 1;
+
+    logger.info('Starting orchestration', {
+      mode: useHierarchical ? 'hierarchical' : 'flat',
+      clusters: clusterCount,
+    });
 
     // Calculate max runtime
     const maxRuntimeMs = (this.config.maxRunDurationMinutes || 120) * 60 * 1000;
@@ -491,12 +664,16 @@ export class Orchestrator extends EventEmitter {
       }
 
       try {
-        await this.runSingleIteration(projectDirection, iteration);
+        if (useHierarchical) {
+          await this.runHierarchicalIteration(projectDirection, iteration);
+        } else {
+          await this.runFlatIteration(projectDirection, iteration);
+        }
       } catch (error: any) {
         logger.error(`Iteration ${iteration} failed`, { error: error.message });
         // Continue to next iteration unless it's a fatal error
         if (error.message?.includes('No more work')) {
-          logger.info('Lead indicated no more work to do');
+          logger.info('Orchestrator indicated no more work to do');
           break;
         }
       }
@@ -527,18 +704,380 @@ export class Orchestrator extends EventEmitter {
     throw new Error('No project direction found. Provide via config or PROJECT_DIRECTION.md');
   }
 
-  private async runSingleIteration(
+  private async runHierarchicalIteration(
     projectDirection: string,
     iteration: number
   ): Promise<void> {
-    const lead = this.teamStructure!.lead;
-    const workers = this.teamStructure!.workers;
-    const workerCount = workers.length;
+    const architect = this.teamStructure!.architect;
+    const clusters = this.teamStructure!.clusters;
+    const clusterCount = clusters.length;
 
     // ─────────────────────────────────────────────────────────────
-    // Phase 1: Lead creates work plan
+    // Phase 1: Architect assigns goals to Tech Leads
     // ─────────────────────────────────────────────────────────────
-    logger.info(`[Iteration ${iteration}] Phase 1: Lead creating work plan`, { workerCount });
+    logger.info(`[Iteration ${iteration}] Phase 1: Architect assigning goals to Tech Leads`, {
+      clusterCount,
+    });
+
+    const architectPrompt = `
+# Project Direction
+
+${projectDirection}
+
+# Current Status
+
+This is iteration ${iteration} of continuous development with ${clusterCount} feature clusters.
+${iteration > 1 ? 'Previous iterations have already made progress. Focus on REMAINING work.' : 'This is the first iteration.'}
+
+# Your Team Structure
+
+You are the Architect coordinating ${clusterCount} Tech Leads:
+${clusters.map((c, i) => `- lead-${i + 1}: managing ${c.workers.length} workers on ${c.featureBranch}`).join('\n')}
+
+# Your Task
+
+Create a JSON plan assigning high-level goals to each Tech Lead.
+
+IMPORTANT:
+- Each Tech Lead should have an independent feature area
+- Feature areas should NOT overlap or have dependencies
+- Focus on CODE implementation
+
+Output ONLY valid JSON (no markdown code blocks):
+{
+  "features": [
+    {
+      "lead": "lead-1",
+      "featureBranch": "feat/cluster-1",
+      "goal": "Brief description of the feature goal",
+      "files": ["list", "of", "key", "files"],
+      "objectives": ["specific objective 1", "specific objective 2"]
+    }
+  ]
+}
+
+If ALL work is truly complete, output:
+{"status": "complete", "reason": "Explanation"}
+
+Read the project direction and codebase, then output the JSON plan.
+`;
+
+    let architectJson = '';
+    for await (const message of this.sessionManager.executeTask(
+      architect.id,
+      architectPrompt,
+      {
+        tools: ['Read', 'Glob', 'Grep'],
+        allowedTools: ['Read', 'Glob', 'Grep'],
+        model: this.config.model,
+      }
+    )) {
+      this.handleMessage(architect.id, message);
+      if (message.type === 'assistant' && message.message?.content) {
+        for (const block of message.message.content) {
+          if (block.type === 'text') {
+            architectJson += block.text;
+          }
+        }
+      }
+      if (this.state === 'stopped') return;
+    }
+
+    // Parse Architect's plan
+    type FeatureGoal = { lead: string; featureBranch: string; goal: string; files: string[]; objectives: string[] };
+    let featureGoals: FeatureGoal[] = [];
+
+    try {
+      const jsonMatch = architectJson.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const cleanJson = jsonMatch[0].replace(/```json?\n?/g, '').replace(/```\n?/g, '').trim();
+        const parsed = JSON.parse(cleanJson);
+
+        if (parsed.status === 'complete') {
+          logger.info('Architect indicates all work is complete', { reason: parsed.reason });
+          throw new Error('No more work: ' + (parsed.reason || 'All tasks done'));
+        }
+
+        if (parsed.features && Array.isArray(parsed.features)) {
+          for (const raw of parsed.features) {
+            if (raw && typeof raw === 'object') {
+              featureGoals.push({
+                lead: raw.lead || 'lead-1',
+                featureBranch: raw.featureBranch || 'feat/cluster-1',
+                goal: String(raw.goal || raw.area || 'Feature implementation'),
+                files: Array.isArray(raw.files) ? raw.files : ['src/'],
+                objectives: Array.isArray(raw.objectives) ? raw.objectives : ['Implement feature'],
+              });
+            }
+          }
+        }
+      }
+
+      logger.info('Architect plan parsed', { featureCount: featureGoals.length });
+    } catch (error) {
+      logger.error('Failed to parse architect plan', { error, architectJson: architectJson.substring(0, 1000) });
+      // Fallback: assign each cluster a section
+      for (let i = 0; i < clusters.length; i++) {
+        featureGoals.push({
+          lead: clusters[i].lead.id,
+          featureBranch: clusters[i].featureBranch,
+          goal: `Section ${i + 1} from PROJECT_DIRECTION.md`,
+          files: ['src/'],
+          objectives: ['Read PROJECT_DIRECTION.md', 'Implement section', 'Run tests'],
+        });
+      }
+    }
+
+    // Ensure we have goals for all clusters
+    if (featureGoals.length === 0) {
+      for (let i = 0; i < clusters.length; i++) {
+        featureGoals.push({
+          lead: clusters[i].lead.id,
+          featureBranch: clusters[i].featureBranch,
+          goal: `Section ${i + 1} from PROJECT_DIRECTION.md`,
+          files: ['src/'],
+          objectives: ['Read PROJECT_DIRECTION.md', 'Implement section', 'Run tests'],
+        });
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 2: Tech Leads assign work to Workers (parallel)
+    // ─────────────────────────────────────────────────────────────
+    logger.info(`[Iteration ${iteration}] Phase 2: Tech Leads creating worker assignments`);
+
+    type Assignment = { worker: string; area: string; files: string[]; tasks: string[]; acceptance: string };
+    const clusterWorkerAssignments = new Map<string, Assignment[]>();
+
+    await Promise.all(
+      clusters.map(async (cluster) => {
+        const goal = featureGoals.find((g) => g.lead === cluster.lead.id) ||
+          featureGoals.find((g) => g.featureBranch === cluster.featureBranch) ||
+          { lead: cluster.lead.id, featureBranch: cluster.featureBranch, goal: 'Feature implementation', files: ['src/'], objectives: ['Implement'] };
+
+        const workerCount = cluster.workers.length;
+
+        const leadPrompt = `
+# Your Feature Goal
+
+${goal.goal}
+
+# Objectives
+${goal.objectives.map((o, i) => `${i + 1}. ${o}`).join('\n')}
+
+# Key Files
+${goal.files.map(f => `- ${f}`).join('\n')}
+
+# Your Task
+
+You are ${cluster.lead.id}, managing ${workerCount} Workers on ${cluster.featureBranch}.
+
+Create a JSON work plan for your Workers.
+
+Output ONLY valid JSON (no markdown):
+{
+  "assignments": [
+    {
+      "worker": "worker-1",
+      "area": "Brief description",
+      "files": ["file1", "file2"],
+      "tasks": ["task1", "task2"],
+      "acceptance": "How to verify"
+    }
+  ]
+}
+
+Read the codebase, then output the JSON plan.
+`;
+
+        let leadJson = '';
+        for await (const message of this.sessionManager.executeTask(
+          cluster.lead.id,
+          leadPrompt,
+          { tools: ['Read', 'Glob', 'Grep'], allowedTools: ['Read', 'Glob', 'Grep'], model: this.config.model }
+        )) {
+          this.handleMessage(cluster.lead.id, message);
+          if (message.type === 'assistant' && message.message?.content) {
+            for (const block of message.message.content) {
+              if (block.type === 'text') {
+                leadJson += block.text;
+              }
+            }
+          }
+          if (this.state === 'stopped') return;
+        }
+
+        // Parse assignments
+        let assignments: Assignment[] = [];
+
+        try {
+          const jsonMatch = leadJson.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const cleanJson = jsonMatch[0].replace(/```json?\n?/g, '').replace(/```\n?/g, '').trim();
+            const parsed = JSON.parse(cleanJson);
+
+            if (parsed.assignments && Array.isArray(parsed.assignments)) {
+              for (const raw of parsed.assignments) {
+                if (raw && typeof raw === 'object') {
+                  assignments.push({
+                    worker: raw.worker || 'worker-1',
+                    area: String(raw.area || 'Task'),
+                    files: Array.isArray(raw.files) ? raw.files : ['src/'],
+                    tasks: Array.isArray(raw.tasks) ? raw.tasks : ['Implement'],
+                    acceptance: String(raw.acceptance || 'Tests pass'),
+                  });
+                }
+              }
+            }
+          }
+
+          logger.info(`${cluster.lead.id} plan parsed`, { assignmentCount: assignments.length });
+        } catch (error) {
+          logger.error(`Failed to parse ${cluster.lead.id} plan`, { error });
+          // Fallback
+          for (let i = 0; i < workerCount; i++) {
+            const workerNum = clusters.indexOf(cluster) * 5 + i + 1;
+            assignments.push({
+              worker: `worker-${workerNum}`,
+              area: `${goal.goal} - Part ${i + 1}`,
+              files: goal.files,
+              tasks: goal.objectives,
+              acceptance: 'Tests pass',
+            });
+          }
+        }
+
+        // Ensure assignments for all workers
+        if (assignments.length === 0) {
+          for (let i = 0; i < workerCount; i++) {
+            const workerNum = clusters.indexOf(cluster) * 5 + i + 1;
+            assignments.push({
+              worker: `worker-${workerNum}`,
+              area: `${goal.goal} - Part ${i + 1}`,
+              files: goal.files,
+              tasks: goal.objectives,
+              acceptance: 'Tests pass',
+            });
+          }
+        }
+
+        clusterWorkerAssignments.set(cluster.featureBranch, assignments);
+      })
+    );
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 3: Execute Workers and merge to feature branches
+    // ─────────────────────────────────────────────────────────────
+    logger.info(`[Iteration ${iteration}] Phase 3: Executing workers and merging to feature branches`);
+
+    for (const cluster of clusters) {
+      const assignments = clusterWorkerAssignments.get(cluster.featureBranch) || [];
+
+      // Process this cluster's workers
+      const workerPromises = assignments.map((assignment) => {
+        const workerSession = cluster.workers.find((w: Session) => w.id === assignment.worker);
+        if (!workerSession) {
+          return Promise.resolve({ workerId: assignment.worker, worker: assignment.worker, success: false, error: 'Session not found' });
+        }
+        return this.executeWorkerAssignmentInCluster(assignment, workerSession, cluster.featureBranch, iteration);
+      });
+
+      // Wait for all workers in this cluster to complete
+      const results = await Promise.all(workerPromises);
+
+      // Merge workers to feature branch
+      for (const result of results) {
+        if (result.success && result.workerId) {
+          try {
+            // Merge worker branch to feature branch
+            await runGit(this.repoPath!, ['fetch', 'origin'], { allowFailure: true });
+            await runGit(this.repoPath!, ['checkout', cluster.featureBranch]);
+
+            try {
+              await runGit(this.repoPath!, ['merge', `origin/${result.workerId}`, '-m', `Merge ${result.workerId}`]);
+              this.stats.merges++;
+              logger.info(`Merged ${result.workerId} to ${cluster.featureBranch}`);
+            } catch {
+              logger.warn(`Merge conflict for ${result.workerId}, auto-resolving`);
+              // Auto-resolve
+              await runGit(this.repoPath!, ['diff', '--name-only', '--diff-filter=U'], { allowFailure: true })
+                .then((r) => {
+                  const unmergedFiles = (typeof r?.stdout === 'string' ? r.stdout : '').split('\n').filter(Boolean);
+                  return Promise.all(unmergedFiles.map((file) =>
+                    runGit(this.repoPath!, ['checkout', '--theirs', file], { allowFailure: true })
+                      .catch(() => runGit(this.repoPath!, ['checkout', '--ours', file], { allowFailure: true }))
+                  ));
+                });
+              await runGit(this.repoPath!, ['add', '.'], { allowFailure: true });
+              await runGit(this.repoPath!, ['commit', '-m', `Merge ${result.workerId} (auto-resolved)`], { allowFailure: true });
+              this.stats.conflicts++;
+            }
+
+            // Push feature branch
+            await runGit(this.repoPath!, ['push', 'origin', cluster.featureBranch], { allowFailure: true });
+          } catch (mergeErr) {
+            logger.error(`Failed to merge ${result.workerId} to ${cluster.featureBranch}`, { error: mergeErr });
+          }
+        }
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 4: Merge feature branches to main (if ready)
+    // ─────────────────────────────────────────────────────────────
+    logger.info(`[Iteration ${iteration}] Phase 4: Merging feature branches to main`);
+
+    for (const cluster of clusters) {
+      try {
+        await runGit(this.repoPath!, ['fetch', 'origin'], { allowFailure: true });
+        await runGit(this.repoPath!, ['checkout', this.workBranch!]);
+
+        try {
+          await runGit(this.repoPath!, ['merge', `origin/${cluster.featureBranch}`, '-m', `Merge ${cluster.featureBranch}`]);
+          this.stats.merges++;
+          logger.info(`Merged ${cluster.featureBranch} to main`);
+        } catch {
+          logger.warn(`Merge conflict for ${cluster.featureBranch}, auto-resolving`);
+          // Auto-resolve
+          await runGit(this.repoPath!, ['diff', '--name-only', '--diff-filter=U'], { allowFailure: true })
+            .then((r) => {
+              const unmergedFiles = (typeof r?.stdout === 'string' ? r.stdout : '').split('\n').filter(Boolean);
+              return Promise.all(unmergedFiles.map((file) =>
+                runGit(this.repoPath!, ['checkout', '--theirs', file], { allowFailure: true })
+                  .catch(() => runGit(this.repoPath!, ['checkout', '--ours', file], { allowFailure: true }))
+              ));
+            });
+          await runGit(this.repoPath!, ['add', '.'], { allowFailure: true });
+          await runGit(this.repoPath!, ['commit', '-m', `Merge ${cluster.featureBranch} (auto-resolved)`], { allowFailure: true });
+          this.stats.conflicts++;
+        }
+
+        // Push main branch
+        await runGit(this.repoPath!, ['push', 'origin', this.workBranch!], { allowFailure: true });
+      } catch (mergeErr) {
+        logger.error(`Failed to merge ${cluster.featureBranch} to main`, { error: mergeErr });
+      }
+    }
+
+    logger.info(`[Iteration ${iteration}] Hierarchical iteration complete`, {
+      clustersProcessed: clusters.length,
+      stats: this.stats,
+    });
+  }
+
+  private async runFlatIteration(
+    projectDirection: string,
+    iteration: number
+  ): Promise<void> {
+    // Get architect and all workers from all clusters
+    const architect = this.teamStructure!.architect;
+    const allWorkers = this.teamStructure!.clusters.flatMap((c: TeamCluster) => c.workers);
+    const workerCount = allWorkers.length;
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 1: Architect creates work plan
+    // ─────────────────────────────────────────────────────────────
+    logger.info(`[Iteration ${iteration}] Phase 1: Architect creating work plan`, { workerCount });
 
     const planPrompt = `
 # Project Direction
@@ -572,16 +1111,16 @@ Read the project direction and codebase, then output the JSON plan.
 
     let planJson = '';
     for await (const message of this.sessionManager.executeTask(
-      lead.id,
+      architect.id,
       planPrompt,
       {
-        // Lead uses read-only tools (prevents git index locks)
+        // Architect uses read-only tools (prevents git index locks)
         tools: ['Read', 'Glob', 'Grep'],
         allowedTools: ['Read', 'Glob', 'Grep'],
         model: this.config.model,
       }
     )) {
-      this.handleMessage(lead.id, message);
+      this.handleMessage(architect.id, message);
 
       // Capture text output for JSON parsing
       if (message.type === 'assistant' && message.message?.content) {
@@ -595,7 +1134,7 @@ Read the project direction and codebase, then output the JSON plan.
       if (this.state === 'stopped') return;
     }
 
-    // Parse the lead's plan
+    // Parse the architect's plan
     type Assignment = { worker: string; area: string; files: string[]; tasks: string[]; acceptance: string };
     let assignments: Assignment[] = [];
 
@@ -618,7 +1157,7 @@ Read the project direction and codebase, then output the JSON plan.
       }
 
       if (!cleanJson) {
-        throw new Error('No JSON object found in lead output');
+        throw new Error('No JSON object found in architect output');
       }
 
       // Final cleanup
@@ -626,9 +1165,9 @@ Read the project direction and codebase, then output the JSON plan.
 
       const parsed = JSON.parse(cleanJson);
 
-      // Check if lead says work is complete
+      // Check if architect says work is complete
       if (parsed.status === 'complete') {
-        logger.info('Lead indicates all work is complete', { reason: parsed.reason });
+        logger.info('Architect indicates all work is complete', { reason: parsed.reason });
         throw new Error('No more work: ' + (parsed.reason || 'All tasks done'));
       }
 
@@ -648,9 +1187,9 @@ Read the project direction and codebase, then output the JSON plan.
         }
       }
 
-      logger.info('Lead plan parsed', { assignmentCount: assignments.length });
+      logger.info('Architect plan parsed', { assignmentCount: assignments.length });
     } catch (error) {
-      logger.error('Failed to parse lead plan', { error, planJson: planJson.substring(0, 1000) });
+      logger.error('Failed to parse architect plan', { error, planJson: planJson.substring(0, 1000) });
       // Fallback: create default assignments for each worker
       logger.warn('Using fallback plan assignments');
       for (let i = 1; i <= workerCount; i++) {
@@ -666,7 +1205,7 @@ Read the project direction and codebase, then output the JSON plan.
 
     // Ensure we have assignments for all workers
     if (assignments.length === 0) {
-      logger.warn('No valid assignments from lead, using fallback');
+      logger.warn('No valid assignments from architect, using fallback');
       for (let i = 1; i <= workerCount; i++) {
         assignments.push({
           worker: `worker-${i}`,
@@ -687,7 +1226,7 @@ Read the project direction and codebase, then output the JSON plan.
     });
 
     const workerPromises = assignments.map((assignment) => {
-      const workerSession = workers.find(w => w.id === assignment.worker);
+      const workerSession = allWorkers.find((w: Session) => w.id === assignment.worker);
       if (!workerSession) {
         logger.warn('Worker session not found', { worker: assignment.worker });
         return Promise.resolve({ worker: assignment.worker, success: false, error: 'Session not found', result: undefined });
@@ -720,7 +1259,8 @@ Read the project direction and codebase, then output the JSON plan.
         logger.info(`Worker completed, merging: ${workerId}`, { resultLength: result.result?.length });
         try {
           const branch = this.workBranch!;
-          await runGit(this.repoPath!, ['fetch', 'origin', workerId], { allowFailure: true });
+          // Fetch all remotes to update remote tracking branches (needed for origin/workerId)
+          await runGit(this.repoPath!, ['fetch', 'origin'], { allowFailure: true });
           await runGit(this.repoPath!, ['checkout', branch]);
           try {
             await runGit(this.repoPath!, ['merge', `origin/${workerId}`, '-m', `Merge ${workerId} branch`]);
@@ -776,12 +1316,12 @@ If ALL work is truly complete (verified), output:
 Output ONLY valid JSON (no markdown).
 `;
 
-        // Get new assignment from Lead
+        // Get new assignment from Architect
         logger.info(`Requesting new work for ${workerId}`, { reassignmentRound });
         let newAssignmentJson = '';
         try {
           for await (const message of this.sessionManager.executeTask(
-            lead.id,
+            architect.id,
             newWorkPrompt,
             { tools: ['Read', 'Glob', 'Grep'], allowedTools: ['Read', 'Glob', 'Grep'], model: this.config.model }
           )) {
@@ -797,12 +1337,12 @@ Output ONLY valid JSON (no markdown).
           if (jsonMatch) {
             const parsed = JSON.parse(jsonMatch[0]);
             if (parsed.status === 'complete') {
-              logger.info(`Lead says work complete for ${workerId}`, { reason: parsed.reason });
+              logger.info(`Architect says work complete for ${workerId}`, { reason: parsed.reason });
               // Don't add back to pending - this Worker is done
             } else if (parsed.worker && parsed.area) {
               // Valid new assignment - start Worker on new work
               logger.info(`New assignment for ${workerId}`, { area: parsed.area });
-              const workerSession = workers.find(w => w.id === workerId);
+              const workerSession = allWorkers.find((w: Session) => w.id === workerId);
               if (workerSession) {
                 const newPromise = this.executeWorkerAssignment(parsed, workerSession, iteration);
                 pendingPromises.set(workerId, newPromise);
@@ -837,6 +1377,138 @@ Output ONLY valid JSON (no markdown).
       completed: completedWorkers.length,
       stats: this.stats,
     });
+  }
+
+  /**
+   * Execute a Worker assignment in a cluster (for hierarchical model)
+   */
+  private async executeWorkerAssignmentInCluster(
+    assignment: { worker: string; area: string; files: string[]; tasks: string[]; acceptance: string },
+    workerSession: Session,
+    featureBranch: string,
+    iteration: number
+  ): Promise<{ worker: string; success: boolean; result?: string; error?: string; workerId: string }> {
+    const workerPrompt = `
+# Your Assignment: ${assignment.area}
+
+You are ${assignment.worker}, a skilled software engineer.
+
+## Files to Focus On
+${assignment.files.map(f => `- ${f}`).join('\n')}
+
+## Tasks
+${assignment.tasks.map((t, i) => `${i + 1}. ${t}`).join('\n')}
+
+## Acceptance Criteria
+${assignment.acceptance}
+
+## CRITICAL RULES
+- IMPLEMENT CODE - do not create documentation
+- Edit source files (.rs, .ts, .js, etc.)
+- Write tests when appropriate
+- Commit with clear messages
+- Push your branch (${assignment.worker}) when done
+
+## Git Workflow
+- Work on your branch (${assignment.worker})
+- Make atomic commits as you complete changes
+- Push when done
+
+**START IMPLEMENTING NOW.**
+`;
+
+    logger.info(`Starting Worker: ${assignment.worker}`, { area: assignment.area, iteration, featureBranch });
+
+    // ─────────────────────────────────────────────────────────────
+    // ANTI-DRIFT: Proactive Sync (Start)
+    // ─────────────────────────────────────────────────────────────
+    // Ensure worker is up to date with the feature branch before starting.
+    // This prevents them from writing code based on a stale version.
+    if (workerSession?.worktreePath) {
+      try {
+        // Fetch the latest feature branch
+        await runGit(workerSession.worktreePath, ['fetch', 'origin', featureBranch], { allowFailure: true });
+        // Reset hard to match remote feature branch start point to avoid history divergence
+        // Only do this if we don't have local unpushed commits we care about (which we shouldn't at start of task)
+        await runGit(workerSession.worktreePath, ['reset', '--hard', `origin/${featureBranch}`], { allowFailure: true });
+        logger.debug(`Synced ${assignment.worker} worktree to ${featureBranch}`);
+      } catch (err) {
+        logger.warn(`Failed to sync worker start state: ${assignment.worker}`, { error: err });
+      }
+    }
+
+    try {
+      let result = '';
+      for await (const message of this.sessionManager.executeTask(
+        workerSession.id,
+        workerPrompt,
+        {
+          tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
+          allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
+          model: this.config.model,
+        }
+      )) {
+        if (message.type === 'assistant' && message.message?.content) {
+          for (const block of message.message.content) {
+            if (block.type === 'tool_use') {
+              const input = block.input as Record<string, unknown>;
+              let details = '';
+              if (block.name === 'Read' || block.name === 'Write' || block.name === 'Edit') {
+                details = String(input?.file_path || input?.path || '').split('/').slice(-2).join('/');
+              } else if (block.name === 'Bash') {
+                details = String(input?.command || '').slice(0, 60);
+              } else if (block.name === 'Grep' || block.name === 'Glob') {
+                details = String(input?.pattern || '').slice(0, 40);
+              }
+              logger.info('Tool call', { sessionId: assignment.worker, tool: block.name, details: details || undefined });
+            }
+            if (block.type === 'text') {
+              result += block.text;
+            }
+          }
+        }
+
+        if (this.state === 'stopped') {
+          return { workerId: assignment.worker, worker: assignment.worker, success: false, error: 'Orchestrator stopped' };
+        }
+      }
+
+      // Ensure worker branch is pushed to origin
+      if (workerSession?.worktreePath) {
+        try {
+          await runGit(workerSession.worktreePath, ['add', '.'], { allowFailure: true });
+          await runGit(workerSession.worktreePath, ['commit', '-m', `Worker ${assignment.worker}: ${assignment.area}`], { allowFailure: true });
+
+          // ─────────────────────────────────────────────────────────────
+          // ANTI-DRIFT: Proactive Sync (End)
+          // ─────────────────────────────────────────────────────────────
+          // Before pushing, pull --rebase to catch any changes that happened while working.
+          // This creates a linear history and prevents simple "out of date" push rejections.
+          logger.info(`Anti-drift sync for ${assignment.worker} against ${featureBranch}`);
+          try {
+            await runGit(workerSession.worktreePath, ['fetch', 'origin', featureBranch]);
+            await runGit(workerSession.worktreePath, ['pull', '--rebase', 'origin', featureBranch]);
+          } catch (rebaseErr) {
+            logger.warn(`Rebase failed for ${assignment.worker}, aborting rebase and trying standard merge`, { error: rebaseErr });
+            await runGit(workerSession.worktreePath, ['rebase', '--abort'], { allowFailure: true });
+            // Fallback to standard pull (merge)
+            await runGit(workerSession.worktreePath, ['pull', 'origin', featureBranch], { allowFailure: true });
+          }
+
+          await runGit(workerSession.worktreePath, ['push', 'origin', assignment.worker], { allowFailure: true });
+          logger.info(`Pushed worker branch: ${assignment.worker}`);
+        } catch (pushErr) {
+          logger.warn(`Failed to push worker branch: ${assignment.worker}`, { error: pushErr });
+        }
+      }
+
+      logger.info(`Worker completed: ${assignment.worker}`, { resultLength: result.length });
+      return { workerId: assignment.worker, worker: assignment.worker, success: true, result };
+    } catch (error: any) {
+      const errorMessage = error?.message || error?.shortMessage || String(error);
+      logger.error(`Worker failed: ${assignment.worker}`, { error: errorMessage });
+      return { workerId: assignment.worker, worker: assignment.worker, success: false, error: errorMessage };
+    }
   }
 
   /**
@@ -877,6 +1549,25 @@ ${assignment.acceptance}
 `;
 
     logger.info(`Starting Worker: ${assignment.worker}`, { area: assignment.area, iteration });
+
+    const targetBranch = this.workBranch!; // In flat mode, we target the main run branch
+
+    // ─────────────────────────────────────────────────────────────
+    // ANTI-DRIFT: Proactive Sync (Start)
+    // ─────────────────────────────────────────────────────────────
+    // Ensure worker is up to date with the target branch before starting.
+    // This prevents them from writing code based on a stale version.
+    if (workerSession?.worktreePath) {
+      try {
+        // Fetch the latest target branch
+        await runGit(workerSession.worktreePath, ['fetch', 'origin', targetBranch], { allowFailure: true });
+        // Reset hard to match remote target branch start point to avoid history divergence
+        await runGit(workerSession.worktreePath, ['reset', '--hard', `origin/${targetBranch}`], { allowFailure: true });
+        logger.debug(`Synced ${assignment.worker} worktree to ${targetBranch}`);
+      } catch (err) {
+        logger.warn(`Failed to sync worker start state: ${assignment.worker}`, { error: err });
+      }
+    }
 
     try {
       let result = '';
@@ -921,6 +1612,23 @@ ${assignment.acceptance}
         try {
           await runGit(workerSession.worktreePath, ['add', '.'], { allowFailure: true });
           await runGit(workerSession.worktreePath, ['commit', '-m', `Worker ${assignment.worker}: ${assignment.area}`], { allowFailure: true });
+
+          // ─────────────────────────────────────────────────────────────
+          // ANTI-DRIFT: Proactive Sync (End)
+          // ─────────────────────────────────────────────────────────────
+          // Before pushing, pull --rebase to catch any changes that happened while working.
+          // This creates a linear history and prevents simple "out of date" push rejections.
+          logger.info(`Anti-drift sync for ${assignment.worker} against ${targetBranch}`);
+          try {
+            await runGit(workerSession.worktreePath, ['fetch', 'origin', targetBranch]);
+            await runGit(workerSession.worktreePath, ['pull', '--rebase', 'origin', targetBranch]);
+          } catch (rebaseErr) {
+            logger.warn(`Rebase failed for ${assignment.worker}, aborting rebase and trying standard merge`, { error: rebaseErr });
+            await runGit(workerSession.worktreePath, ['rebase', '--abort'], { allowFailure: true });
+            // Fallback to standard pull (merge)
+            await runGit(workerSession.worktreePath, ['pull', 'origin', targetBranch], { allowFailure: true });
+          }
+
           await runGit(workerSession.worktreePath, ['push', 'origin', assignment.worker], { allowFailure: true });
           logger.info(`Pushed worker branch: ${assignment.worker}`);
         } catch (pushErr) {

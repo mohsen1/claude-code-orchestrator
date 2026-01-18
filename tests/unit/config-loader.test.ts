@@ -121,7 +121,7 @@ describe('ConfigLoader', () => {
     it('should reject worker count above maximum', async () => {
       await writeFile(
         join(testDir, 'orchestrator.json'),
-        JSON.stringify({ ...validConfig, workerCount: 100 })
+        JSON.stringify({ ...validConfig, workerCount: 101 })
       );
 
       await expect(loader.loadOrchestratorConfig()).rejects.toThrow();

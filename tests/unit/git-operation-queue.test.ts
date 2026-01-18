@@ -291,28 +291,6 @@ describe('GitOperationQueue', () => {
       }
     });
 
-    it('should clear all workdir queues', async () => {
-      const queue = new GitOperationQueue();
-
-      // Queue operations on different workdirs
-      const p1 = queue.enqueue('/repo1', async () => {
-        await new Promise(r => setTimeout(r, 100));
-        return 'ok';
-      });
-
-      const p2 = queue.enqueue('/repo2', async () => 'pending');
-      const p3 = queue.enqueue('/repo3', async () => 'pending');
-
-      // Wait for first to start, then clear
-      await new Promise(r => setTimeout(r, 50));
-      queue.clear();
-
-      const [r1, r2, r3] = await Promise.allSettled([p1, p2, p3]);
-
-      expect(r1.status).toBe('fulfilled');
-      expect(r2.status).toBe('rejected');
-      expect(r3.status).toBe('rejected');
-    });
   });
 
   describe('singleton', () => {

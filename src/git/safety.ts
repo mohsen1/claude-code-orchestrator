@@ -5,7 +5,7 @@ import { join } from 'path';
 import { logger } from '../utils/logger.js';
 import { getGitQueue } from './operation-queue.js';
 
-const DEFAULT_TIMEOUT_MS = 300000; // 5 minutes for large repos
+const DEFAULT_TIMEOUT_MS = 15000;
 const STALE_LOCK_MS = 2 * 60 * 1000;
 const MAX_LOCK_SCAN_DEPTH = 4;
 

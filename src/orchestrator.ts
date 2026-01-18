@@ -1261,9 +1261,12 @@ Read the project direction and codebase, then output the JSON plan.
           const branch = this.workBranch!;
           // Fetch all remotes to update remote tracking branches (needed for origin/workerId)
           await runGit(this.repoPath!, ['fetch', 'origin'], { allowFailure: true });
+          // Explicitly fetch the worker branch to ensure it's available locally
+          await runGit(this.repoPath!, ['fetch', 'origin', `${workerId}:${workerId}`], { allowFailure: true });
           await runGit(this.repoPath!, ['checkout', branch]);
           try {
-            await runGit(this.repoPath!, ['merge', `origin/${workerId}`, '-m', `Merge ${workerId} branch`]);
+            // Merge using the local ref (not origin/workerId)
+            await runGit(this.repoPath!, ['merge', workerId, '-m', `Merge ${workerId} branch`]);
             this.stats.merges++;
             logger.info(`Merged: ${workerId}`);
           } catch {
@@ -1478,7 +1481,8 @@ ${assignment.acceptance}
         try {
           await runGit(workerSession.worktreePath, ['add', '.'], { allowFailure: true });
           await runGit(workerSession.worktreePath, ['commit', '-m', `Worker ${assignment.worker}: ${assignment.area}`], { allowFailure: true });
-          await runGit(workerSession.worktreePath, ['push', 'origin', assignment.worker], { allowFailure: true });
+          // Push WITHOUT allowFailure to see actual errors
+          await runGit(workerSession.worktreePath, ['push', '-u', 'origin', assignment.worker]);
           logger.info(`Pushed worker branch: ${assignment.worker}`);
         } catch (pushErr) {
           logger.warn(`Failed to push worker branch: ${assignment.worker}`, { error: pushErr });
@@ -1595,7 +1599,8 @@ ${assignment.acceptance}
         try {
           await runGit(workerSession.worktreePath, ['add', '.'], { allowFailure: true });
           await runGit(workerSession.worktreePath, ['commit', '-m', `Worker ${assignment.worker}: ${assignment.area}`], { allowFailure: true });
-          await runGit(workerSession.worktreePath, ['push', 'origin', assignment.worker], { allowFailure: true });
+          // Push WITHOUT allowFailure to see actual errors
+          await runGit(workerSession.worktreePath, ['push', '-u', 'origin', assignment.worker]);
           logger.info(`Pushed worker branch: ${assignment.worker}`);
         } catch (pushErr) {
           logger.warn(`Failed to push worker branch: ${assignment.worker}`, { error: pushErr });

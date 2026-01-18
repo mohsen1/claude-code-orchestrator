@@ -1478,23 +1478,6 @@ ${assignment.acceptance}
         try {
           await runGit(workerSession.worktreePath, ['add', '.'], { allowFailure: true });
           await runGit(workerSession.worktreePath, ['commit', '-m', `Worker ${assignment.worker}: ${assignment.area}`], { allowFailure: true });
-
-          // ─────────────────────────────────────────────────────────────
-          // ANTI-DRIFT: Proactive Sync (End)
-          // ─────────────────────────────────────────────────────────────
-          // Before pushing, pull --rebase to catch any changes that happened while working.
-          // This creates a linear history and prevents simple "out of date" push rejections.
-          logger.info(`Anti-drift sync for ${assignment.worker} against ${featureBranch}`);
-          try {
-            await runGit(workerSession.worktreePath, ['fetch', 'origin', featureBranch]);
-            await runGit(workerSession.worktreePath, ['pull', '--rebase', 'origin', featureBranch]);
-          } catch (rebaseErr) {
-            logger.warn(`Rebase failed for ${assignment.worker}, aborting rebase and trying standard merge`, { error: rebaseErr });
-            await runGit(workerSession.worktreePath, ['rebase', '--abort'], { allowFailure: true });
-            // Fallback to standard pull (merge)
-            await runGit(workerSession.worktreePath, ['pull', 'origin', featureBranch], { allowFailure: true });
-          }
-
           await runGit(workerSession.worktreePath, ['push', 'origin', assignment.worker], { allowFailure: true });
           logger.info(`Pushed worker branch: ${assignment.worker}`);
         } catch (pushErr) {
@@ -1612,23 +1595,6 @@ ${assignment.acceptance}
         try {
           await runGit(workerSession.worktreePath, ['add', '.'], { allowFailure: true });
           await runGit(workerSession.worktreePath, ['commit', '-m', `Worker ${assignment.worker}: ${assignment.area}`], { allowFailure: true });
-
-          // ─────────────────────────────────────────────────────────────
-          // ANTI-DRIFT: Proactive Sync (End)
-          // ─────────────────────────────────────────────────────────────
-          // Before pushing, pull --rebase to catch any changes that happened while working.
-          // This creates a linear history and prevents simple "out of date" push rejections.
-          logger.info(`Anti-drift sync for ${assignment.worker} against ${targetBranch}`);
-          try {
-            await runGit(workerSession.worktreePath, ['fetch', 'origin', targetBranch]);
-            await runGit(workerSession.worktreePath, ['pull', '--rebase', 'origin', targetBranch]);
-          } catch (rebaseErr) {
-            logger.warn(`Rebase failed for ${assignment.worker}, aborting rebase and trying standard merge`, { error: rebaseErr });
-            await runGit(workerSession.worktreePath, ['rebase', '--abort'], { allowFailure: true });
-            // Fallback to standard pull (merge)
-            await runGit(workerSession.worktreePath, ['pull', 'origin', targetBranch], { allowFailure: true });
-          }
-
           await runGit(workerSession.worktreePath, ['push', 'origin', assignment.worker], { allowFailure: true });
           logger.info(`Pushed worker branch: ${assignment.worker}`);
         } catch (pushErr) {

@@ -353,6 +353,8 @@ export class SessionManager extends EventEmitter {
       if (this.isRateLimitError(error)) {
         this.emit('session:rate-limited', { sessionId });
         this.rotateApiKey();
+        // Update this session to use the new API key
+        session.authConfigIndex = this.currentApiKeyIndex;
 
         return {
           success: false,

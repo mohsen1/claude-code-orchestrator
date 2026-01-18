@@ -17,7 +17,8 @@ import {
   createWorkerAgents,
   type AgentDefinition,
 } from './agents.js';
-import { createDefaultHooks, gitLock, type HooksConfig } from './hooks.js';
+import { createDefaultHooks, type HooksConfig } from './hooks.js';
+import { runGit } from './git/safety.js';
 import type {
   OrchestratorConfig,
   OrchestratorStatus,
@@ -305,9 +306,9 @@ export class Orchestrator extends EventEmitter {
     if (existsSync(this.repoPath)) {
       // Pull latest
       logger.info('Repository exists, pulling latest');
-      await this.runGit(['fetch', 'origin'], this.repoPath);
-      await this.runGit(['checkout', branch], this.repoPath);
-      await this.runGit(['pull', 'origin', branch], this.repoPath);
+      await runGit(this.repoPath, ['fetch', 'origin']);
+      await runGit(this.repoPath, ['checkout', branch]);
+      await runGit(this.repoPath, ['pull', 'origin', branch]);
     } else if (localRepoPath) {
       // Copy from local path (faster than cloning)
       logger.info('Copying repository from local path', { localRepoPath, branch });
@@ -316,7 +317,7 @@ export class Orchestrator extends EventEmitter {
       // Create the target directory
       await mkdir(this.repoPath, { recursive: true });
 
-      // Use rsync to copy
+      // Use rsync to copy (note: excludes node_modules for speed)
       await execa('rsync', [
         '-aH',
         '--exclude', '.orchestrator',
@@ -325,15 +326,15 @@ export class Orchestrator extends EventEmitter {
         `${this.repoPath}/`,
       ]);
 
-      // Checkout the desired branch
-      await this.runGit(['checkout', branch], this.repoPath);
-      await this.runGit(['pull', 'origin', branch], this.repoPath, { ignoreError: true });
+      // Reset any changes from rsync excludes and checkout the desired branch
+      await runGit(this.repoPath, ['reset', '--hard', 'HEAD'], { allowFailure: true });
+      await runGit(this.repoPath, ['checkout', '--force', branch]);
+      await runGit(this.repoPath, ['pull', 'origin', branch], { allowFailure: true });
     } else {
       // Clone
       logger.info('Cloning repository', { repositoryUrl, branch });
-      await mkdir(this.repoPath, { recursive: true });
-
-      // Build clone arguments
+      
+      // Build clone arguments - clone directly to target directory
       const cloneArgs = ['clone', '--branch', branch];
       const cloneOpts = this.config.gitCloneOptions;
       if (cloneOpts?.depth) {
@@ -345,9 +346,14 @@ export class Orchestrator extends EventEmitter {
       if (cloneOpts?.noSubmodules) {
         cloneArgs.push('--no-recurse-submodules');
       }
-      cloneArgs.push(repositoryUrl, '.');
+      cloneArgs.push(repositoryUrl, this.repoPath);
 
-      await this.runGit(cloneArgs, this.repoPath);
+      // Clone from parent directory (no -C flag needed)
+      const { execa } = await import('execa');
+      await execa('git', cloneArgs, { 
+        cwd: workspaceDir,
+        timeout: 300000 // 5 minutes for large repos
+      });
     }
 
     // Set up the work branch (either same as source branch, or a new run branch)
@@ -355,8 +361,8 @@ export class Orchestrator extends EventEmitter {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
       this.workBranch = `run-${timestamp}`;
 
-      await this.runGit(['checkout', '-b', this.workBranch], this.repoPath);
-      await this.runGit(['push', '-u', 'origin', this.workBranch], this.repoPath);
+      await runGit(this.repoPath, ['checkout', '-b', this.workBranch]);
+      await runGit(this.repoPath, ['push', '-u', 'origin', this.workBranch]);
 
       logger.info('Created run branch', { workBranch: this.workBranch, sourceBranch: branch });
     } else {
@@ -419,26 +425,20 @@ export class Orchestrator extends EventEmitter {
       return worktreePath;
     }
 
-    // Create branch and worktree
-    await gitLock.acquire();
-    try {
-      // Create or checkout branch
-      await this.runGit(
-        ['branch', name],
-        this.repoPath!,
-        { ignoreError: true }
-      );
+    // Create branch and worktree (operations are serialized via GitOperationQueue)
+    // Prune any stale worktrees first
+    await runGit(this.repoPath!, ['worktree', 'prune'], { allowFailure: true });
 
-      // Create worktree
-      await this.runGit(
-        ['worktree', 'add', worktreePath, name],
-        this.repoPath!
-      );
+    // Create or checkout branch
+    await runGit(this.repoPath!, ['branch', name], { allowFailure: true });
 
-      logger.info('Created worktree', { name, path: worktreePath });
-    } finally {
-      gitLock.release();
-    }
+    // Create worktree (use -f to force if already registered)
+    await runGit(this.repoPath!, ['worktree', 'add', '-f', worktreePath, name]);
+
+    // Push the worker branch to origin so it exists remotely
+    await runGit(this.repoPath!, ['push', '-u', 'origin', name], { allowFailure: true });
+
+    logger.info('Created worktree', { name, path: worktreePath });
 
     return worktreePath;
   }
@@ -483,9 +483,9 @@ export class Orchestrator extends EventEmitter {
       // Pull latest changes from remote before each iteration
       try {
         const branch = this.workBranch!;
-        await this.runGit(['fetch', 'origin', branch], this.repoPath!, { ignoreError: true });
-        await this.runGit(['checkout', branch], this.repoPath!, { ignoreError: true });
-        await this.runGit(['pull', 'origin', branch], this.repoPath!, { ignoreError: true });
+        await runGit(this.repoPath!, ['fetch', 'origin', branch], { allowFailure: true });
+        await runGit(this.repoPath!, ['checkout', branch], { allowFailure: true });
+        await runGit(this.repoPath!, ['pull', 'origin', branch], { allowFailure: true });
       } catch (pullError) {
         logger.warn('Failed to pull latest changes', { error: pullError });
       }
@@ -720,40 +720,40 @@ Read the project direction and codebase, then output the JSON plan.
         logger.info(`Worker completed, merging: ${workerId}`, { resultLength: result.result?.length });
         try {
           const branch = this.workBranch!;
-          await this.runGit(['fetch', 'origin', workerId], this.repoPath!, { ignoreError: true });
-          await this.runGit(['checkout', branch], this.repoPath!);
+          await runGit(this.repoPath!, ['fetch', 'origin', workerId], { allowFailure: true });
+          await runGit(this.repoPath!, ['checkout', branch]);
           try {
-            await this.runGit(['merge', `origin/${workerId}`, '-m', `Merge ${workerId} branch`], this.repoPath!);
+            await runGit(this.repoPath!, ['merge', `origin/${workerId}`, '-m', `Merge ${workerId} branch`]);
             this.stats.merges++;
             logger.info(`Merged: ${workerId}`);
           } catch {
             logger.warn(`Merge conflict for ${workerId}, auto-resolving`);
             // Accept theirs for content conflicts
-            const unmergedList = await this.runGit(
-              ['diff', '--name-only', '--diff-filter=U'],
+            const unmergedResult = await runGit(
               this.repoPath!,
-              { ignoreError: true }
+              ['diff', '--name-only', '--diff-filter=U'],
+              { allowFailure: true }
             );
-            const unmergedFiles = unmergedList?.split('\n').filter(Boolean) || [];
+            const unmergedFiles = (typeof unmergedResult?.stdout === 'string' ? unmergedResult.stdout : '').split('\n').filter(Boolean);
             for (const file of unmergedFiles) {
               try {
-                await this.runGit(['checkout', '--theirs', file], this.repoPath!, { ignoreError: true });
+                await runGit(this.repoPath!, ['checkout', '--theirs', file], { allowFailure: true });
               } catch {
-                await this.runGit(['checkout', '--ours', file], this.repoPath!, { ignoreError: true });
+                await runGit(this.repoPath!, ['checkout', '--ours', file], { allowFailure: true });
               }
             }
-            await this.runGit(['add', '.'], this.repoPath!, { ignoreError: true });
-            await this.runGit(['commit', '-m', `Merge ${workerId} (auto-resolved)`], this.repoPath!, { ignoreError: true });
+            await runGit(this.repoPath!, ['add', '.'], { allowFailure: true });
+            await runGit(this.repoPath!, ['commit', '-m', `Merge ${workerId} (auto-resolved)`], { allowFailure: true });
             this.stats.conflicts++;
           }
           // Push after each merge
-          await this.runGit(['push', 'origin', branch], this.repoPath!, { ignoreError: true });
+          await runGit(this.repoPath!, ['push', 'origin', branch], { allowFailure: true });
         } catch (mergeErr) {
           logger.error(`Failed to merge ${workerId}`, { error: mergeErr });
         }
 
         // Ask Lead for new work for this Worker
-        await this.runGit(['pull', 'origin', this.workBranch!, '--rebase'], this.repoPath!, { ignoreError: true });
+        await runGit(this.repoPath!, ['pull', 'origin', this.workBranch!, '--rebase'], { allowFailure: true });
 
         reassignmentRound++;
         const newWorkPrompt = `
@@ -824,10 +824,10 @@ Output ONLY valid JSON (no markdown).
     // Final sync - ensure work branch is pushed
     const branch = this.workBranch!;
     try {
-      await this.runGit(['checkout', branch], this.repoPath!);
-      await this.runGit(['fetch', 'origin', branch], this.repoPath!, { ignoreError: true });
-      await this.runGit(['rebase', `origin/${branch}`], this.repoPath!, { ignoreError: true });
-      await this.runGit(['push', 'origin', branch], this.repoPath!);
+      await runGit(this.repoPath!, ['checkout', branch]);
+      await runGit(this.repoPath!, ['fetch', 'origin', branch], { allowFailure: true });
+      await runGit(this.repoPath!, ['rebase', `origin/${branch}`], { allowFailure: true });
+      await runGit(this.repoPath!, ['push', 'origin', branch]);
       logger.info(`[Iteration ${iteration}] Final push to origin complete`, { branch });
     } catch (error) {
       logger.error(`[Iteration ${iteration}] Final push failed`, { error, branch });
@@ -916,6 +916,18 @@ ${assignment.acceptance}
         }
       }
 
+      // Ensure worker branch is pushed to origin
+      if (workerSession?.worktreePath) {
+        try {
+          await runGit(workerSession.worktreePath, ['add', '.'], { allowFailure: true });
+          await runGit(workerSession.worktreePath, ['commit', '-m', `Worker ${assignment.worker}: ${assignment.area}`], { allowFailure: true });
+          await runGit(workerSession.worktreePath, ['push', 'origin', assignment.worker], { allowFailure: true });
+          logger.info(`Pushed worker branch: ${assignment.worker}`);
+        } catch (pushErr) {
+          logger.warn(`Failed to push worker branch: ${assignment.worker}`, { error: pushErr });
+        }
+      }
+
       logger.info(`Worker completed: ${assignment.worker}`, { resultLength: result.length });
       return { worker: assignment.worker, success: true, result };
     } catch (error: any) {
@@ -981,24 +993,6 @@ ${assignment.acceptance}
   // Utility Methods
   // ─────────────────────────────────────────────────────────────
 
-  private async runGit(
-    args: string[],
-    cwd: string,
-    options?: { ignoreError?: boolean }
-  ): Promise<string> {
-    const { execa } = await import('execa');
-
-    try {
-      const result = await execa('git', args, { cwd });
-      return result.stdout;
-    } catch (error: any) {
-      if (options?.ignoreError) {
-        return error.stdout || '';
-      }
-      throw error;
-    }
-  }
-
   private emitEvent(type: OrchestratorEvent['type'], data: Record<string, unknown>): void {
     const event: OrchestratorEvent = {
       type,
@@ -1032,6 +1026,17 @@ ${assignment.acceptance}
         this.emitEvent(event as OrchestratorEvent['type'], data);
       });
     }
+
+    // Handle session compaction for long-running sessions
+    this.sessionManager.on('session:needs-compaction', async (data: { sessionId: string }) => {
+      logger.info('Session needs compaction, triggering...', { sessionId: data.sessionId });
+      try {
+        await this.sessionManager.compactSession(data.sessionId);
+        logger.info('Session compacted successfully', { sessionId: data.sessionId });
+      } catch (error) {
+        logger.error('Failed to compact session', { sessionId: data.sessionId, error });
+      }
+    });
   }
 
   private sleep(ms: number): Promise<void> {

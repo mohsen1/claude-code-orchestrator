@@ -310,7 +310,13 @@ export class Orchestrator extends EventEmitter {
       logger.info('Repository exists, pulling latest');
       await runGit(this.repoPath, ['fetch', 'origin']);
       await runGit(this.repoPath, ['checkout', branch]);
-      await runGit(this.repoPath, ['pull', 'origin', branch]);
+
+      // Try pull, but handle unrelated histories gracefully
+      const pullResult = await runGit(this.repoPath, ['pull', 'origin', branch], { allowFailure: true });
+      if (pullResult.failed && String(pullResult.stderr || '').includes('unrelated histories')) {
+        logger.warn('Unrelated histories detected, resetting to origin/' + branch);
+        await runGit(this.repoPath, ['reset', '--hard', `origin/${branch}`]);
+      }
     } else if (localRepoPath) {
       // Copy from local path (faster than cloning)
       logger.info('Copying repository from local path', { localRepoPath, branch });

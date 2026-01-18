@@ -172,8 +172,8 @@ export async function runGit(
   const safeCommands = ['rev-parse', 'branch', '--show-current', 'log', 'diff', 'show', 'ls-tree', 'cat-file'];
   const isSafeCommand = safeCommands.some(cmd => args.includes(cmd)) && !args.includes('checkout');
 
-  // Auto-detect global operations (fetch, push, gc, remote operations)
-  const globalCommands = ['fetch', 'push', 'gc', 'remote'];
+  // Auto-detect global operations (fetch, push, gc, remote, worktree operations)
+  const globalCommands = ['fetch', 'push', 'gc', 'remote', 'worktree'];
   const isGlobalOperation = options.isGlobal ?? globalCommands.some(cmd => args.includes(cmd));
 
   if (options.skipQueue || isSafeCommand) {

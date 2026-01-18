@@ -692,8 +692,8 @@ Be comprehensive but concise.
       this.config.apiKeys.length === 0 ||
       session.authConfigIndex === undefined
     ) {
-      // Use OAuth or no specific key
-      delete process.env.ANTHROPIC_API_KEY;
+      // Use OAuth or no specific key - ensure ANTHROPIC_AUTH_TOKEN is not deleted
+      // so it can be inherited from parent environment for z.ai etc.
       return;
     }
 
@@ -701,7 +701,7 @@ Be comprehensive but concise.
 
     // Handle direct apiKey format
     if (keyConfig?.apiKey) {
-      process.env.ANTHROPIC_API_KEY = keyConfig.apiKey;
+      process.env.ANTHROPIC_AUTH_TOKEN = keyConfig.apiKey;
     }
 
     // Handle env-based format (e.g., z.ai configs)

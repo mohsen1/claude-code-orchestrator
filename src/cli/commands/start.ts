@@ -312,6 +312,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
     workerCount: config.workerCount,
     model: config.model || 'opus',
     authMode: config.authMode || 'oauth',
+    apiKeys: authConfigs,
     taskTimeoutMs: config.taskTimeoutMs,
     pollIntervalMs: config.pollIntervalMs,
     maxRunDurationMinutes: config.maxRunDurationMinutes,

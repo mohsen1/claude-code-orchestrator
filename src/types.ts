@@ -56,6 +56,7 @@ export interface OrchestratorConfig {
 
   // Auth
   authMode: 'oauth' | 'api-keys-first' | 'api-keys-only';
+  apiKeys?: AuthConfig[];
 
   // Observability
   auditLog: boolean;
@@ -312,6 +313,7 @@ export interface PersistedSession {
   taskCount: number;
   createdAt: string;
   lastActiveAt: string;
+  authConfigIndex?: number;
 }
 
 // ─────────────────────────────────────────────────────────────

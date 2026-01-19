@@ -34,6 +34,7 @@ import type {
   PersistedSession,
   ProgressStats,
 } from './types.js';
+import { logger } from './utils/logger.js';
 
 // ─────────────────────────────────────────────────────────────
 // Session Manager Configuration
@@ -132,6 +133,11 @@ export class SessionManager extends EventEmitter {
     this.sessions.set(id, session);
     this.emit('session:created', { sessionId: id, role, worktreePath });
 
+    // Write .claude/settings.json for the session if it has a worktree
+    this.writeSessionAuthSettings(session).catch((err) => {
+      logger.warn('Failed to write initial session auth settings', { sessionId: id, error: err });
+    });
+
     return session;
   }
 
@@ -228,9 +234,12 @@ export class SessionManager extends EventEmitter {
         const nodeAbsPath = process.execPath;
         const nodeBinDir = nodeAbsPath.replace(/\/node$/, '');
         const voltaShimDir = process.env.VOLTA_HOME ? `${process.env.VOLTA_HOME}/bin` : '';
+
+        // Start with SDK's env, then override with our process.env
+        // This ensures our rotated API keys take precedence over SDK's cached credentials
         const env = {
-          ...process.env,
           ...spawnOpts.env,
+          ...process.env,
           PATH: `${nodeBinDir}:${voltaShimDir}:${spawnOpts.env?.PATH || process.env.PATH}`,
         };
         // Replace 'node' command with absolute path
@@ -329,6 +338,30 @@ export class SessionManager extends EventEmitter {
       taskRecord.inputTokens = inputTokens;
       taskRecord.outputTokens = outputTokens;
 
+      // Check if result contains rate limit message
+      if (this.isRateLimitError(result)) {
+        this.emit('session:rate-limited', { sessionId });
+        this.rotateApiKey();
+        // Update this session to use the new API key
+        session.authConfigIndex = this.currentApiKeyIndex;
+        // Clear the Claude session ID to force a new process with new credentials
+        session.claudeSessionId = undefined;
+        session.status = 'failed';
+
+        // Update process.env and write .claude/settings.json for the new credentials
+        this.setApiKeyForSession(session);
+
+        this.emit('task:error', { sessionId, error: result });
+
+        return {
+          success: false,
+          output: result,
+          error: result,
+          durationMs: Date.now() - startTime,
+          rateLimited: true,
+        };
+      }
+
       // Update session metrics
       session.metrics.totalTokensUsed += inputTokens + outputTokens;
       session.metrics.taskCount++;
@@ -355,6 +388,11 @@ export class SessionManager extends EventEmitter {
         this.rotateApiKey();
         // Update this session to use the new API key
         session.authConfigIndex = this.currentApiKeyIndex;
+        // Clear the Claude session ID to force a new process with new credentials
+        session.claudeSessionId = undefined;
+
+        // Update process.env and write .claude/settings.json for the new credentials
+        this.setApiKeyForSession(session);
 
         return {
           success: false,
@@ -631,6 +669,7 @@ Be comprehensive but concise.
       taskCount: session.taskHistory.length,
       createdAt: session.createdAt.toISOString(),
       lastActiveAt: session.lastActiveAt.toISOString(),
+      authConfigIndex: session.authConfigIndex,
     }));
   }
 
@@ -647,6 +686,7 @@ Be comprehensive but concise.
         metrics: p.metrics,
         createdAt: new Date(p.createdAt),
         lastActiveAt: new Date(p.lastActiveAt),
+        authConfigIndex: p.authConfigIndex !== undefined ? p.authConfigIndex : this.getNextAuthConfigIndex(),
       };
       this.sessions.set(p.id, session);
     }
@@ -687,6 +727,15 @@ Be comprehensive but concise.
   }
 
   private setApiKeyForSession(session: Session): void {
+    logger.info('setApiKeyForSession check', {
+      sessionId: session.id,
+      authMode: this.config.authMode,
+      authModeIsOAuth: this.config.authMode === 'oauth',
+      apiKeysCount: this.config.apiKeys.length,
+      authConfigIndex: session.authConfigIndex,
+      authConfigIndexIsUndefined: session.authConfigIndex === undefined,
+    });
+
     if (
       this.config.authMode === 'oauth' ||
       this.config.apiKeys.length === 0 ||
@@ -694,10 +743,21 @@ Be comprehensive but concise.
     ) {
       // Use OAuth or no specific key - ensure ANTHROPIC_AUTH_TOKEN is not deleted
       // so it can be inherited from parent environment for z.ai etc.
+      logger.info('Using OAuth mode', { sessionId: session.id, authMode: this.config.authMode });
       return;
     }
 
     const keyConfig = this.config.apiKeys[session.authConfigIndex];
+
+    // Log what we're using for debugging
+    logger.info('Setting API key for session', {
+      sessionId: session.id,
+      authMode: this.config.authMode,
+      authConfigIndex: session.authConfigIndex,
+      hasApiKeyConfig: !!keyConfig,
+      baseUrl: keyConfig?.env?.ANTHROPIC_BASE_URL || 'default',
+      tokenPrefix: keyConfig?.env?.ANTHROPIC_AUTH_TOKEN?.substring(0, 20) + '...',
+    });
 
     // Handle direct apiKey format
     if (keyConfig?.apiKey) {
@@ -719,6 +779,106 @@ Be comprehensive but concise.
         process.env[key] = value;
       }
     }
+
+    // Write .claude/settings.json to the worktree directory
+    // This ensures the Claude Code CLI reads the correct auth config
+    this.writeSessionAuthSettings(session).catch((err) => {
+      logger.error('Failed to write session auth settings', { sessionId: session.id, error: err });
+    });
+  }
+
+  /**
+   * Write .claude/settings.json for a session
+   * This ensures the Claude Code CLI reads the correct auth config from the worktree
+   */
+  private async writeSessionAuthSettings(session: Session): Promise<void> {
+    logger.info('writeSessionAuthSettings called', {
+      sessionId: session.id,
+      worktreePath: session.worktreePath,
+      authConfigIndex: session.authConfigIndex,
+      authMode: this.config.authMode,
+      apiKeysCount: this.config.apiKeys.length,
+    });
+
+    if (!session.worktreePath || session.authConfigIndex === undefined) {
+      logger.info('Skipping settings write - missing worktreePath or authConfigIndex', {
+        sessionId: session.id,
+        hasWorktreePath: !!session.worktreePath,
+        hasAuthConfigIndex: session.authConfigIndex !== undefined,
+      });
+      return;
+    }
+
+    if (
+      this.config.authMode === 'oauth' ||
+      this.config.apiKeys.length === 0
+    ) {
+      // No API keys to write - using OAuth
+      logger.info('Skipping settings write - using OAuth or no API keys', {
+        sessionId: session.id,
+        authMode: this.config.authMode,
+        apiKeysCount: this.config.apiKeys.length,
+      });
+      return;
+    }
+
+    const keyConfig = this.config.apiKeys[session.authConfigIndex];
+    if (!keyConfig) {
+      logger.warn('No key config found for authConfigIndex', {
+        sessionId: session.id,
+        authConfigIndex: session.authConfigIndex,
+        apiKeysCount: this.config.apiKeys.length,
+      });
+      return;
+    }
+
+    try {
+      const claudeDir = join(session.worktreePath, '.claude');
+      await mkdir(claudeDir, { recursive: true });
+
+      const settingsPath = join(claudeDir, 'settings.json');
+
+      // Build settings object
+      const settings: Record<string, any> = {};
+
+      // Handle env-based format (z.ai)
+      if (keyConfig.env) {
+        settings.env = { ...keyConfig.env };
+      }
+
+      // Handle direct apiKey format
+      if (keyConfig.apiKey) {
+        settings.env = {
+          ...(settings.env || {}),
+          ANTHROPIC_AUTH_TOKEN: keyConfig.apiKey,
+        };
+      }
+
+      // Handle env overrides
+      if (keyConfig.envOverrides) {
+        settings.env = {
+          ...(settings.env || {}),
+          ...keyConfig.envOverrides,
+        };
+      }
+
+      // Write settings if we have something to write
+      if (Object.keys(settings).length > 0) {
+        await writeFile(settingsPath, JSON.stringify(settings, null, 2), 'utf-8');
+        logger.info('Wrote .claude/settings.json for session', {
+          sessionId: session.id,
+          worktreePath: session.worktreePath,
+          settingsPath,
+          hasEnv: !!settings.env,
+        });
+      }
+    } catch (error) {
+      logger.error('Failed to write .claude/settings.json for session', {
+        sessionId: session.id,
+        worktreePath: session.worktreePath,
+        error,
+      });
+    }
   }
 
   private rotateApiKey(): void {
@@ -736,7 +896,9 @@ Be comprehensive but concise.
       message.includes('rate limit') ||
       message.includes('rate_limit') ||
       message.includes('quota exceeded') ||
-      message.includes('too many requests')
+      message.includes('too many requests') ||
+      message.includes('hit your limit') ||
+      message.includes("hit's your limit")  // Handle "You've hit your limit"
     );
   }
 

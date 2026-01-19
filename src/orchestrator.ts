@@ -81,6 +81,9 @@ export class Orchestrator extends EventEmitter {
     super();
     this.config = { ...DEFAULT_CONFIG, ...config } as OrchestratorConfig;
 
+    // Extract API keys from config
+    this.apiKeys = this.config.apiKeys || [];
+
     // Configure logger directory
     configureLogDirectory(this.config.logDirectory || join(this.config.workspaceDir, 'logs'));
 
@@ -677,6 +680,17 @@ export class Orchestrator extends EventEmitter {
         }
       } catch (error: any) {
         logger.error(`Iteration ${iteration} failed`, { error: error.message });
+
+        // Check if this is a rate limit error
+        if (this.isRateLimitResult(error.message) || this.isRateLimitResult(error)) {
+          logger.warn('Rate limit detected, retrying iteration after auth rotation');
+          // Brief pause to allow auth rotation to take effect
+          await this.sleep(2000);
+          // Retry the same iteration
+          iteration--;
+          continue;
+        }
+
         // Continue to next iteration unless it's a fatal error
         if (error.message?.includes('No more work')) {
           logger.info('Orchestrator indicated no more work to do');
@@ -769,6 +783,7 @@ Read the project direction and codebase, then output the JSON plan.
 `;
 
     let architectJson = '';
+    let result = null;
     for await (const message of this.sessionManager.executeTask(
       architect.id,
       architectPrompt,
@@ -786,7 +801,15 @@ Read the project direction and codebase, then output the JSON plan.
           }
         }
       }
+      if (message.type === 'result') {
+        result = (message as any).result || '';
+      }
       if (this.state === 'stopped') return;
+    }
+
+    // Check for rate limit error in result
+    if (result && this.isRateLimitResult(result)) {
+      throw new Error(`Rate limit detected: ${result}`);
     }
 
     // Parse Architect's plan
@@ -897,6 +920,7 @@ Read the codebase, then output the JSON plan.
 `;
 
         let leadJson = '';
+        let leadResult = null;
         for await (const message of this.sessionManager.executeTask(
           cluster.lead.id,
           leadPrompt,
@@ -910,7 +934,15 @@ Read the codebase, then output the JSON plan.
               }
             }
           }
+          if (message.type === 'result') {
+            leadResult = (message as any).result || '';
+          }
           if (this.state === 'stopped') return;
+        }
+
+        // Check for rate limit error in result
+        if (leadResult && this.isRateLimitResult(leadResult)) {
+          throw new Error(`Rate limit detected in ${cluster.lead.id}: ${leadResult}`);
         }
 
         // Parse assignments
@@ -1116,6 +1148,7 @@ Read the project direction and codebase, then output the JSON plan.
 `;
 
     let planJson = '';
+    let planResult = null;
     for await (const message of this.sessionManager.executeTask(
       architect.id,
       planPrompt,
@@ -1137,7 +1170,16 @@ Read the project direction and codebase, then output the JSON plan.
         }
       }
 
+      if (message.type === 'result') {
+        planResult = (message as any).result || '';
+      }
+
       if (this.state === 'stopped') return;
+    }
+
+    // Check for rate limit error in result
+    if (planResult && this.isRateLimitResult(planResult)) {
+      throw new Error(`Rate limit detected: ${planResult}`);
     }
 
     // Parse the architect's plan
@@ -1722,6 +1764,19 @@ ${assignment.acceptance}
         logger.error('Failed to compact session', { sessionId: data.sessionId, error });
       }
     });
+  }
+
+  private isRateLimitResult(result: string): boolean {
+    const message = String(result);
+    return (
+      message.includes('429') ||
+      message.includes('rate limit') ||
+      message.includes('rate_limit') ||
+      message.includes('quota exceeded') ||
+      message.includes('too many requests') ||
+      message.includes('hit your limit') ||
+      message.includes("hit's your limit")
+    );
   }
 
   private sleep(ms: number): Promise<void> {

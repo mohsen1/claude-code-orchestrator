@@ -4,6 +4,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { logger } from '../utils/logger.js';
 import { getGitQueue } from './operation-queue.js';
+import { executeSubprocess } from '../utils/subprocess-handler.js';
 
 const DEFAULT_TIMEOUT_MS = 15000;
 const STALE_LOCK_MS = 2 * 60 * 1000;
@@ -26,12 +27,13 @@ type GitRunResult = Awaited<ReturnType<typeof execa>>;
 
 export async function getGitDir(workDir: string): Promise<string | null> {
   try {
-    const result = await execa('git', ['-C', workDir, 'rev-parse', '--absolute-git-dir'], {
-      reject: false,
+    const result = await executeSubprocess('git', ['-C', workDir, 'rev-parse', '--absolute-git-dir'], {
       timeout: DEFAULT_TIMEOUT_MS,
       env: { ...process.env, GIT_PAGER: 'cat' },
+      allowFailure: true,
+      reject: false,
     });
-    if (result.exitCode !== 0) {
+    if (!result.success || result.exitCode !== 0) {
       return null;
     }
     const gitDir = result.stdout.trim();
@@ -128,12 +130,37 @@ async function runGitImmediate(
 
   await clearStaleGitLocks(workDir);
 
-  const attempt = async () =>
-    execa('git', ['-C', workDir, ...args], {
-      reject: !(options.allowFailure ?? false),
+  const attempt = async () => {
+    // Use subprocess handler for better isolation and crash detection
+    const result = await executeSubprocess('git', ['-C', workDir, ...args], {
       timeout: timeoutMs,
       env,
+      allowFailure: options.allowFailure ?? false,
+      reject: false, // We'll handle rejection ourselves
+      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
     });
+
+    // Convert to execa-like result format
+    if (result.success) {
+      return {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode ?? 0,
+        failed: false,
+        isCancelled: false,
+        killed: false,
+      } as unknown as GitRunResult;
+    } else {
+      // Throw in the expected format
+      const error = new Error(result.error || `Git command failed with exit code ${result.exitCode}`);
+      (error as any).exitCode = result.exitCode;
+      (error as any).stdout = result.stdout;
+      (error as any).stderr = result.stderr;
+      (error as any).timedOut = result.timedOut;
+      (error as any).signal = result.signal;
+      throw error;
+    }
+  };
 
   try {
     return await attempt();

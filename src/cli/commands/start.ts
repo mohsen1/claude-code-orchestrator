@@ -9,6 +9,8 @@ import type { OrchestratorConfig, AuthConfig } from '../../types.js';
 import { ConfigLoader } from '../../config/loader.js';
 import { logger, configureLogDirectory } from '../../utils/logger.js';
 import { extractRepoName } from '../../utils/repo.js';
+import { initCrashLogger, setupCrashHandlers, closeCrashLogger, logCrash } from '../../utils/crash-logger.js';
+import { createMemoryMonitor } from '../../utils/memory-monitor.js';
 
 interface StartOptions {
   config?: string;
@@ -173,25 +175,37 @@ async function createRunLogDirectory(baseDir: string): Promise<string> {
 }
 
 /**
- * Set up signal handlers for graceful shutdown
+ * Set up signal handlers for graceful shutdown with crash logging
  */
-function setupSignalHandlers(orchestrator: Orchestrator): void {
+function setupSignalHandlers(orchestrator: Orchestrator, memoryMonitor: ReturnType<typeof createMemoryMonitor>): void {
   let isShuttingDown = false;
 
   const shutdown = async (signal: string): Promise<void> => {
     if (isShuttingDown) {
+      logCrash('Shutdown already in progress, forcing exit...');
       logger.warn('Shutdown already in progress, forcing exit...');
       process.exit(1);
     }
 
     isShuttingDown = true;
     logger.info(`Received ${signal}, initiating graceful shutdown...`);
+    logCrash(`Received ${signal}, initiating graceful shutdown...`);
 
     try {
+      // Stop memory monitor
+      memoryMonitor.stop();
+
+      // Stop orchestrator
       await orchestrator.stop(signal);
+
+      // Close crash logger
+      closeCrashLogger();
+
       process.exit(0);
     } catch (err) {
       logger.error('Error during shutdown', err);
+      logCrash('Error during shutdown', { error: String(err) });
+      closeCrashLogger();
       process.exit(1);
     }
   };
@@ -199,16 +213,23 @@ function setupSignalHandlers(orchestrator: Orchestrator): void {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
+  // Global error handlers (setup via crash logger)
+  setupCrashHandlers();
+
+  // Additional orchestrator-specific handling
   process.on('uncaughtException', async (err) => {
     logger.error('Uncaught exception', err);
+    logCrash('Orchestrator uncaught exception', { error: err.message, stack: err.stack });
+    memoryMonitor.stop();
     await orchestrator.stop('uncaughtException');
+    closeCrashLogger();
     process.exit(1);
   });
 
   process.on('unhandledRejection', async (reason) => {
     logger.error('Unhandled rejection', reason);
-    await orchestrator.stop('unhandledRejection');
-    process.exit(1);
+    logCrash('Orchestrator unhandled rejection', { reason: String(reason) });
+    // Don't exit for rejections, just log
   });
 }
 
@@ -250,6 +271,10 @@ export async function startCommand(options: StartOptions): Promise<void> {
   const logBaseDir = await resolveLogBaseDir(configDir);
   const runLogDir = await createRunLogDirectory(logBaseDir);
   configureLogDirectory(runLogDir);
+
+  // Initialize crash logger (synchronous writes to survive crashes)
+  initCrashLogger(runLogDir);
+  logCrash('Claude Code Orchestrator starting', { runLogDir });
 
   // Load and validate configuration
   const loader = new ConfigLoader(configDir);
@@ -329,7 +354,24 @@ export async function startCommand(options: StartOptions): Promise<void> {
 
   // Create and start orchestrator
   const orchestrator = new Orchestrator(orchConfig);
-  setupSignalHandlers(orchestrator);
+
+  // Create memory monitor with thresholds based on worker count
+  const memoryMonitor = createMemoryMonitor({
+    warningThreshold: 500 + (config.workerCount || 2) * 50,  // 500MB base + 50MB per worker
+    criticalThreshold: 1000 + (config.workerCount || 2) * 100, // 1000MB base + 100MB per worker
+    maximumThreshold: 2000 + (config.workerCount || 2) * 150,  // 2000MB base + 150MB per worker
+    checkInterval: 30000, // Check every 30 seconds
+    enableThrottling: true,
+  });
+
+  setupSignalHandlers(orchestrator, memoryMonitor);
+
+  // Start memory monitor
+  memoryMonitor.start(config.workerCount || 2);
+  logger.info('Memory monitor started', {
+    workerCount: config.workerCount,
+    warningThreshold: memoryMonitor.getMemoryStats().heapUsedMB,
+  });
 
   // Forward events to logger with verbose output
   orchestrator.on('tool:start', (event) => {
@@ -377,10 +419,15 @@ export async function startCommand(options: StartOptions): Promise<void> {
   try {
     await orchestrator.start();
     clearInterval(progressInterval);
+    memoryMonitor.stop();
+    closeCrashLogger();
     logger.info('Orchestrator completed');
   } catch (err) {
     clearInterval(progressInterval);
+    memoryMonitor.stop();
     logger.error('Orchestrator failed', err);
+    logCrash('Orchestrator failed', { error: String(err) });
+    closeCrashLogger();
     process.exit(1);
   }
 }

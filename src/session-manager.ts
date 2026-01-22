@@ -898,7 +898,9 @@ Be comprehensive but concise.
       message.includes('quota exceeded') ||
       message.includes('too many requests') ||
       message.includes('hit your limit') ||
-      message.includes("hit's your limit")  // Handle "You've hit your limit"
+      message.includes("hit's your limit") ||
+      // Claude Code process exiting with code 1 often indicates API key issues
+      message.includes('exited with code 1')
     );
   }
 

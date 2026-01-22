@@ -280,6 +280,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
       repository: config.repositoryUrl,
       branch: config.branch,
       workerCount: config.workerCount,
+      groupSize: config.groupSize,
       model: config.model,
       authMode: config.authMode,
     });
@@ -310,6 +311,7 @@ export async function startCommand(options: StartOptions): Promise<void> {
     localRepoPath: config.localRepoPath,
     projectDirection: '', // Will be loaded from PROJECT_DIRECTION.md
     workerCount: config.workerCount,
+    groupSize: config.groupSize,
     model: config.model || 'opus',
     authMode: config.authMode || 'oauth',
     apiKeys: authConfigs,

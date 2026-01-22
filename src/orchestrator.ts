@@ -29,6 +29,7 @@ import type {
   TeamStructure,
   TeamCluster,
   AuthConfig,
+  TaskResult,
 } from './types.js';
 import { logger, configureLogDirectory } from './utils/logger.js';
 
@@ -1010,18 +1011,49 @@ Read the codebase, then output the JSON plan.
 
     for (const cluster of clusters) {
       const assignments = clusterWorkerAssignments.get(cluster.featureBranch) || [];
+      // Track assignments for retry
+      const currentAssignments = new Map(assignments.map((a) => [a.worker, a]));
 
-      // Process this cluster's workers
-      const workerPromises = assignments.map((assignment) => {
+      // Process this cluster's workers with retry logic for rate limits
+      let workerPromises = assignments.map((assignment) => {
         const workerSession = cluster.workers.find((w: Session) => w.id === assignment.worker);
         if (!workerSession) {
-          return Promise.resolve({ workerId: assignment.worker, worker: assignment.worker, success: false, error: 'Session not found' });
+          return Promise.resolve({ workerId: assignment.worker, worker: assignment.worker, success: false, error: 'Session not found', rateLimited: undefined });
         }
         return this.executeWorkerAssignmentInCluster(assignment, workerSession, cluster.featureBranch, iteration);
       });
 
-      // Wait for all workers in this cluster to complete
-      const results = await Promise.all(workerPromises);
+      // Wait for all workers in this cluster to complete (with retries for rate limits)
+      let results = await Promise.all(workerPromises);
+
+      // Retry rate-limited workers
+      for (let retry = 0; retry < 3; retry++) {
+        const rateLimitedWorkers = results.filter((r) => r.rateLimited);
+        if (rateLimitedWorkers.length === 0) break;
+
+        logger.info(`Retrying ${rateLimitedWorkers.length} rate-limited workers in cluster`, { featureBranch: cluster.featureBranch, retry: retry + 1 });
+
+        const retryPromises = rateLimitedWorkers.map((result) => {
+          const assignment = currentAssignments.get(result.workerId);
+          const workerSession = cluster.workers.find((w: Session) => w.id === result.workerId);
+          if (!assignment || !workerSession) {
+            return Promise.resolve({ workerId: result.workerId, worker: result.worker, success: false, error: 'Session not found for retry' });
+          }
+          return this.executeWorkerAssignmentInCluster(assignment, workerSession, cluster.featureBranch, iteration);
+        });
+
+        const retryResults = await Promise.all(retryPromises);
+
+        // Update results with retry outcomes
+        for (let i = 0; i < results.length; i++) {
+          if ('rateLimited' in results[i] && results[i].rateLimited) {
+            const retryIndex = retryResults.findIndex((r) => r.workerId === results[i].workerId);
+            if (retryIndex !== -1 && 'rateLimited' in retryResults[retryIndex] && !retryResults[retryIndex].rateLimited) {
+              results[i] = retryResults[retryIndex];
+            }
+          }
+        }
+      }
 
       // Merge workers to feature branch
       for (const result of results) {
@@ -1056,6 +1088,10 @@ Read the codebase, then output the JSON plan.
           } catch (mergeErr) {
             logger.error(`Failed to merge ${result.workerId} to ${cluster.featureBranch}`, { error: mergeErr });
           }
+        } else if ('rateLimited' in result && result.rateLimited) {
+          logger.warn(`Worker ${result.workerId} still rate-limited after retries in cluster ${cluster.featureBranch}`);
+        } else {
+          logger.error(`Worker ${result.workerId} failed in cluster ${cluster.featureBranch}`, { error: result.error });
         }
       }
     }
@@ -1277,7 +1313,7 @@ Read the project direction and codebase, then output the JSON plan.
       const workerSession = allWorkers.find((w: Session) => w.id === assignment.worker);
       if (!workerSession) {
         logger.warn('Worker session not found', { worker: assignment.worker });
-        return Promise.resolve({ worker: assignment.worker, success: false, error: 'Session not found', result: undefined });
+        return Promise.resolve({ worker: assignment.worker, success: false, error: 'Session not found', result: undefined, rateLimited: undefined });
       }
       return this.executeWorkerAssignment(assignment, workerSession, iteration);
     });
@@ -1286,6 +1322,8 @@ Read the project direction and codebase, then output the JSON plan.
     // Continuous merge: As each Worker completes, merge and reassign
     // ─────────────────────────────────────────────────────────────
     const pendingPromises = new Map(workerPromises.map((p, i) => [assignments[i].worker, p]));
+    // Track current assignments for retry (especially for rate-limited workers)
+    const currentAssignments = new Map(assignments.map((a) => [a.worker, a]));
     const completedWorkers: string[] = [];
     let reassignmentRound = 0;
 
@@ -1403,6 +1441,19 @@ Output ONLY valid JSON (no markdown).
         } catch (reassignError) {
           logger.warn(`Failed to get reassignment for ${workerId}`, { error: reassignError });
         }
+      } else if ('rateLimited' in result && result.rateLimited) {
+        // Worker was rate-limited - retry with same assignment using new API key
+        const currentAssignment = currentAssignments.get(workerId);
+        if (currentAssignment) {
+          logger.info(`Retrying rate-limited worker with new API key: ${workerId}`, { area: currentAssignment.area });
+          const workerSession = allWorkers.find((w: Session) => w.id === workerId);
+          if (workerSession) {
+            const retryPromise = this.executeWorkerAssignment(currentAssignment, workerSession, iteration);
+            pendingPromises.set(workerId, retryPromise);
+            // Remove from completed so we wait for retry
+            completedWorkers.pop();
+          }
+        }
       } else {
         logger.error(`Worker failed: ${workerId}`, { error: result.error });
       }
@@ -1438,7 +1489,7 @@ Output ONLY valid JSON (no markdown).
     workerSession: Session,
     featureBranch: string,
     iteration: number
-  ): Promise<{ worker: string; success: boolean; result?: string; error?: string; workerId: string }> {
+  ): Promise<{ worker: string; success: boolean; result?: string; error?: string; workerId: string; rateLimited?: boolean }> {
     const workerPrompt = `
 # Your Assignment: ${assignment.area}
 
@@ -1490,7 +1541,8 @@ ${assignment.acceptance}
 
     try {
       let result = '';
-      for await (const message of this.sessionManager.executeTask(
+      // Capture the generator to get the final return value
+      const generator = this.sessionManager.executeTask(
         workerSession.id,
         workerPrompt,
         {
@@ -1498,7 +1550,10 @@ ${assignment.acceptance}
           allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
           model: this.config.model,
         }
-      )) {
+      );
+
+      // Process messages from the generator
+      for await (const message of generator) {
         if (message.type === 'assistant' && message.message?.content) {
           for (const block of message.message.content) {
             if (block.type === 'tool_use') {
@@ -1520,8 +1575,24 @@ ${assignment.acceptance}
         }
 
         if (this.state === 'stopped') {
-          return { workerId: assignment.worker, worker: assignment.worker, success: false, error: 'Orchestrator stopped' };
+          return { workerId: assignment.worker, worker: assignment.worker, success: false, error: 'Orchestrator stopped', rateLimited: undefined };
         }
+      }
+
+      // Get the final return value from the generator (includes rateLimited status)
+      const finalResult = await generator.next();
+      const taskResult = finalResult.value as TaskResult;
+
+      // If rate limited, return without marking as failed so it can be retried
+      if (taskResult?.rateLimited) {
+        logger.warn(`Worker rate-limited, will retry with new API key: ${assignment.worker}`);
+        return { workerId: assignment.worker, worker: assignment.worker, success: false, error: taskResult.error || 'Rate limited', rateLimited: true };
+      }
+
+      // If task failed (not rate limited), return error
+      if (taskResult && !taskResult.success) {
+        logger.error(`Worker task failed: ${assignment.worker}`, { error: taskResult.error });
+        return { workerId: assignment.worker, worker: assignment.worker, success: false, error: taskResult.error };
       }
 
       // Ensure worker branch is pushed to origin
@@ -1553,7 +1624,7 @@ ${assignment.acceptance}
     assignment: { worker: string; area: string; files: string[]; tasks: string[]; acceptance: string },
     workerSession: Session,
     iteration: number
-  ): Promise<{ worker: string; success: boolean; result?: string; error?: string }> {
+  ): Promise<{ worker: string; success: boolean; result?: string; error?: string; rateLimited?: boolean }> {
     const workerPrompt = `
 # Your Assignment: ${assignment.area}
 
@@ -1606,7 +1677,8 @@ ${assignment.acceptance}
 
     try {
       let result = '';
-      for await (const message of this.sessionManager.executeTask(
+      // Capture the generator to get the final return value
+      const generator = this.sessionManager.executeTask(
         workerSession.id,
         workerPrompt,
         {
@@ -1614,7 +1686,10 @@ ${assignment.acceptance}
           allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task'],
           model: this.config.model,
         }
-      )) {
+      );
+
+      // Process messages from the generator
+      for await (const message of generator) {
         // Log Worker tool calls
         if (message.type === 'assistant' && message.message?.content) {
           for (const block of message.message.content) {
@@ -1638,8 +1713,24 @@ ${assignment.acceptance}
         }
 
         if (this.state === 'stopped') {
-          return { worker: assignment.worker, success: false, error: 'Orchestrator stopped' };
+          return { worker: assignment.worker, success: false, error: 'Orchestrator stopped', rateLimited: undefined };
         }
+      }
+
+      // Get the final return value from the generator (includes rateLimited status)
+      const finalResult = await generator.next();
+      const taskResult = finalResult.value as TaskResult;
+
+      // If rate limited, return without marking as failed so it can be retried
+      if (taskResult?.rateLimited) {
+        logger.warn(`Worker rate-limited, will retry with new API key: ${assignment.worker}`);
+        return { worker: assignment.worker, success: false, error: taskResult.error || 'Rate limited', rateLimited: true };
+      }
+
+      // If task failed (not rate limited), return error
+      if (taskResult && !taskResult.success) {
+        logger.error(`Worker task failed: ${assignment.worker}`, { error: taskResult.error });
+        return { worker: assignment.worker, success: false, error: taskResult.error };
       }
 
       // Ensure worker branch is pushed to origin

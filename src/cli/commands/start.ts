@@ -7,7 +7,7 @@ import inquirer from 'inquirer';
 import { Orchestrator } from '../../orchestrator.js';
 import type { OrchestratorConfig, AuthConfig } from '../../types.js';
 import { ConfigLoader } from '../../config/loader.js';
-import { logger, configureLogDirectory } from '../../utils/logger.js';
+import { logger, configureLogDirectory, createThrottledLogger, flushThrottledLogs } from '../../utils/logger.js';
 import { extractRepoName } from '../../utils/repo.js';
 import { initCrashLogger, setupCrashHandlers, closeCrashLogger, logCrash } from '../../utils/crash-logger.js';
 import { createMemoryMonitor } from '../../utils/memory-monitor.js';
@@ -198,6 +198,9 @@ function setupSignalHandlers(orchestrator: Orchestrator, memoryMonitor: ReturnTy
       // Stop orchestrator
       await orchestrator.stop(signal);
 
+      // Flush any pending throttled logs
+      flushThrottledLogs();
+
       // Close crash logger
       closeCrashLogger();
 
@@ -205,6 +208,7 @@ function setupSignalHandlers(orchestrator: Orchestrator, memoryMonitor: ReturnTy
     } catch (err) {
       logger.error('Error during shutdown', err);
       logCrash('Error during shutdown', { error: String(err) });
+      flushThrottledLogs();
       closeCrashLogger();
       process.exit(1);
     }
@@ -222,6 +226,7 @@ function setupSignalHandlers(orchestrator: Orchestrator, memoryMonitor: ReturnTy
     logCrash('Orchestrator uncaught exception', { error: err.message, stack: err.stack });
     memoryMonitor.stop();
     await orchestrator.stop('uncaughtException');
+    flushThrottledLogs();
     closeCrashLogger();
     process.exit(1);
   });
@@ -374,6 +379,10 @@ export async function startCommand(options: StartOptions): Promise<void> {
   });
 
   // Forward events to logger with verbose output
+  // Use throttled logging for high-frequency events to prevent stack overflow
+  const logQueryStart = createThrottledLogger('Query started', 10000); // Log at most every 10s per batch
+  const logQueryMessage = createThrottledLogger('Query message', 30000); // Log summary every 30s
+
   orchestrator.on('tool:start', (event) => {
     if (event?.data) {
       logger.info('Tool call', { sessionId: event.data.sessionId, tool: event.data.tool });
@@ -392,18 +401,21 @@ export async function startCommand(options: StartOptions): Promise<void> {
     }
   });
 
+  // Throttled: logs first event immediately, then batches for 10s before logging summary
   orchestrator.on('query:start', (event) => {
     if (event?.data) {
-      logger.info('Query started', { sessionId: event.data.sessionId });
+      logQueryStart('Query started', { sessionId: event.data.sessionId });
     }
   });
 
+  // Throttled: batches query messages and logs summary every 30s
   orchestrator.on('query:message', (event) => {
     if (event?.data) {
-      logger.debug('Query message', { sessionId: event.data.sessionId, type: event.data.type });
+      logQueryMessage('Query message', { sessionId: event.data.sessionId, type: event.data.type });
     }
   });
 
+  // text:stream - just write to stdout, no logging (too high frequency)
   orchestrator.on('text:stream', (data) => {
     if (data?.text) {
       process.stdout.write(data.text);
@@ -420,11 +432,13 @@ export async function startCommand(options: StartOptions): Promise<void> {
     await orchestrator.start();
     clearInterval(progressInterval);
     memoryMonitor.stop();
+    flushThrottledLogs(); // Flush any pending batched logs
     closeCrashLogger();
     logger.info('Orchestrator completed');
   } catch (err) {
     clearInterval(progressInterval);
     memoryMonitor.stop();
+    flushThrottledLogs(); // Flush any pending batched logs
     logger.error('Orchestrator failed', err);
     logCrash('Orchestrator failed', { error: String(err) });
     closeCrashLogger();

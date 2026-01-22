@@ -886,6 +886,7 @@ Read the project direction and codebase, then output the JSON plan.
           { lead: cluster.lead.id, featureBranch: cluster.featureBranch, goal: 'Feature implementation', files: ['src/'], objectives: ['Implement'] };
 
         const workerCount = cluster.workers.length;
+        const workersList = cluster.workers.map((w) => w.id).join(', ');
 
         const leadPrompt = `
 # Your Feature Goal
@@ -902,7 +903,12 @@ ${goal.files.map(f => `- ${f}`).join('\n')}
 
 You are ${cluster.lead.id}, managing ${workerCount} Workers on ${cluster.featureBranch}.
 
-Create a JSON work plan for your Workers.
+Your Workers: ${workersList}
+
+IMPORTANT: You must assign work to EXACTLY these workers: ${workersList}.
+Do NOT create assignments for workers outside your team.
+
+Create a JSON work plan with exactly ${workerCount} assignments, one for each worker.
 
 Output ONLY valid JSON (no markdown):
 {

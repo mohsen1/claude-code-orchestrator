@@ -61,6 +61,9 @@ export interface SessionManagerConfig {
 
   /** Auto-save interval (ms) */
   autoSaveIntervalMs: number;
+
+  /** Environment variables to set for all sessions */
+  env?: Record<string, string>;
 }
 
 const DEFAULT_CONFIG: SessionManagerConfig = {
@@ -235,11 +238,14 @@ export class SessionManager extends EventEmitter {
         const nodeBinDir = nodeAbsPath.replace(/\/node$/, '');
         const voltaShimDir = process.env.VOLTA_HOME ? `${process.env.VOLTA_HOME}/bin` : '';
 
-        // Start with SDK's env, then override with our process.env
-        // This ensures our rotated API keys take precedence over SDK's cached credentials
+        // Build environment with priority:
+        // 1. Session manager config env (highest priority - from orchestrator.json)
+        // 2. Current process.env (includes rotated API keys)
+        // 3. SDK's env (lowest priority)
         const env = {
           ...spawnOpts.env,
           ...process.env,
+          ...(this.config.env || {}), // Orchestrator config env takes precedence
           PATH: `${nodeBinDir}:${voltaShimDir}:${spawnOpts.env?.PATH || process.env.PATH}`,
         };
         // Replace 'node' command with absolute path

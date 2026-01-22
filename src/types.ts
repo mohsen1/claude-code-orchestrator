@@ -63,6 +63,14 @@ export interface OrchestratorConfig {
   auditLogPath?: string;
   progressIntervalMs: number;
   logDirectory?: string;
+
+  // Environment
+  envFiles?: string[]; // Paths to env files to copy to each worker worktree
+  env?: Record<string, string>; // Environment variables to set for all sessions
+
+  // Git merge behavior
+  mergeStrategy?: 'auto-resolve' | 'skip' | 'fail' | 'theirs' | 'ours' | 'union'; // How to handle merge conflicts
+  maxAutoResolveConflicts?: number; // Max conflicts per iteration before aborting
 }
 
 // ─────────────────────────────────────────────────────────────

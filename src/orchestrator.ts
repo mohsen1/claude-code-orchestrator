@@ -19,7 +19,7 @@ import {
   type AgentDefinition,
 } from './agents.js';
 import { createDefaultHooks, type HooksConfig } from './hooks.js';
-import { runGit } from './git/safety.js';
+import { runGit, isGitWorkDirClean, getUncommittedFiles } from './git/safety.js';
 import type {
   OrchestratorConfig,
   OrchestratorStatus,
@@ -98,6 +98,7 @@ export class Orchestrator extends EventEmitter {
       apiKeys: this.apiKeys,
       authMode: this.config.authMode,
       permissionMode: this.config.permissionMode,
+      env: this.config.env, // Pass orchestrator env to all sessions
     };
     this.sessionManager = new SessionManager(sessionConfig);
 
@@ -617,6 +618,48 @@ export class Orchestrator extends EventEmitter {
     return worktreePath;
   }
 
+  /**
+   * Validate and clean git state before merge/checkout operations
+   * Prevents "uncommitted changes would be overwritten" errors
+   */
+  private async ensureCleanGitState(operation: string): Promise<void> {
+    if (!this.repoPath) {
+      throw new Error('Repository path not set');
+    }
+
+    const isClean = await isGitWorkDirClean(this.repoPath);
+
+    if (!isClean) {
+      const uncommittedFiles = await getUncommittedFiles(this.repoPath);
+
+      logger.warn(`Git state not clean before ${operation}, cleaning up`, {
+        fileCount: uncommittedFiles.length,
+        files: uncommittedFiles.slice(0, 10),
+      });
+
+      // Try to reset to clean state
+      try {
+        // Abort any merge in progress
+        await runGit(this.repoPath, ['merge', '--abort'], { allowFailure: true });
+
+        // Reset all changes
+        await runGit(this.repoPath, ['reset', '--hard', 'HEAD']);
+
+        // Clean untracked files
+        await runGit(this.repoPath, ['clean', '-fd']);
+
+        logger.info(`Reset git state to clean for ${operation}`, {
+          filesCleared: uncommittedFiles.length,
+        });
+      } catch (resetErr) {
+        logger.error(`Failed to reset git state before ${operation}`, {
+          error: resetErr,
+        });
+        throw new Error(`Cannot proceed with ${operation}: git state is dirty and reset failed`);
+      }
+    }
+  }
+
   // ─────────────────────────────────────────────────────────────
   // Main Orchestration Loop
   // ─────────────────────────────────────────────────────────────
@@ -1068,6 +1111,9 @@ Read the codebase, then output the JSON plan.
       for (const result of results) {
         if (result.success && result.workerId) {
           try {
+            // Ensure clean state before checkout/merge
+            await this.ensureCleanGitState(`merge ${result.workerId}`);
+
             // Merge worker branch to feature branch
             await runGit(this.repoPath!, ['fetch', 'origin'], { allowFailure: true });
             await runGit(this.repoPath!, ['checkout', cluster.featureBranch]);
@@ -1078,18 +1124,32 @@ Read the codebase, then output the JSON plan.
               logger.info(`Merged ${result.workerId} to ${cluster.featureBranch}`);
             } catch {
               logger.warn(`Merge conflict for ${result.workerId}, auto-resolving`);
-              // Auto-resolve
-              await runGit(this.repoPath!, ['diff', '--name-only', '--diff-filter=U'], { allowFailure: true })
-                .then((r) => {
-                  const unmergedFiles = (typeof r?.stdout === 'string' ? r.stdout : '').split('\n').filter(Boolean);
-                  return Promise.all(unmergedFiles.map((file) =>
-                    runGit(this.repoPath!, ['checkout', '--theirs', file], { allowFailure: true })
-                      .catch(() => runGit(this.repoPath!, ['checkout', '--ours', file], { allowFailure: true }))
-                  ));
-                });
+              // Auto-resolve with better logging
+              const unmergedResult = await runGit(this.repoPath!, ['diff', '--name-only', '--diff-filter=U'], { allowFailure: true });
+              const unmergedFiles = (typeof unmergedResult?.stdout === 'string' ? unmergedResult.stdout : '').split('\n').filter(Boolean);
+
+              logger.warn(`Auto-resolving ${unmergedFiles.length} conflicts for ${result.workerId}`, {
+                branch: cluster.featureBranch,
+                files: unmergedFiles.slice(0, 10), // Log first 10 files
+                totalFiles: unmergedFiles.length,
+                strategy: 'theirs-first',
+              });
+
+              // For each file, try --theirs first, then fall back to --ours
+              for (const file of unmergedFiles) {
+                try {
+                  await runGit(this.repoPath!, ['checkout', '--theirs', file], { allowFailure: true });
+                  logger.debug(`Resolved ${file} using --theirs`);
+                } catch {
+                  await runGit(this.repoPath!, ['checkout', '--ours', file], { allowFailure: true });
+                  logger.debug(`Resolved ${file} using --ours (--theirs failed)`);
+                }
+              }
+
               await runGit(this.repoPath!, ['add', '.'], { allowFailure: true });
-              await runGit(this.repoPath!, ['commit', '-m', `Merge ${result.workerId} (auto-resolved)`], { allowFailure: true });
+              await runGit(this.repoPath!, ['commit', '-m', `Merge ${result.workerId} (auto-resolved ${unmergedFiles.length} conflicts)`], { allowFailure: true });
               this.stats.conflicts++;
+              this.stats.conflicts += unmergedFiles.length;
             }
 
             // Push feature branch
@@ -1133,6 +1193,9 @@ Read the codebase, then output the JSON plan.
 
     for (const cluster of clusters) {
       try {
+        // Ensure clean state before checkout/merge
+        await this.ensureCleanGitState(`merge ${cluster.featureBranch} to main`);
+
         await runGit(this.repoPath!, ['fetch', 'origin'], { allowFailure: true });
         await runGit(this.repoPath!, ['checkout', this.workBranch!]);
 
@@ -1142,18 +1205,29 @@ Read the codebase, then output the JSON plan.
           logger.info(`Merged ${cluster.featureBranch} to main`);
         } catch {
           logger.warn(`Merge conflict for ${cluster.featureBranch}, auto-resolving`);
-          // Auto-resolve
-          await runGit(this.repoPath!, ['diff', '--name-only', '--diff-filter=U'], { allowFailure: true })
-            .then((r) => {
-              const unmergedFiles = (typeof r?.stdout === 'string' ? r.stdout : '').split('\n').filter(Boolean);
-              return Promise.all(unmergedFiles.map((file) =>
-                runGit(this.repoPath!, ['checkout', '--theirs', file], { allowFailure: true })
-                  .catch(() => runGit(this.repoPath!, ['checkout', '--ours', file], { allowFailure: true }))
-              ));
-            });
+          // Auto-resolve with better logging
+          const unmergedResult = await runGit(this.repoPath!, ['diff', '--name-only', '--diff-filter=U'], { allowFailure: true });
+          const unmergedFiles = (typeof unmergedResult?.stdout === 'string' ? unmergedResult.stdout : '').split('\n').filter(Boolean);
+
+          logger.warn(`Auto-resolving ${unmergedFiles.length} conflicts for ${cluster.featureBranch}`, {
+            files: unmergedFiles.slice(0, 10),
+            totalFiles: unmergedFiles.length,
+            strategy: 'theirs-first',
+          });
+
+          for (const file of unmergedFiles) {
+            try {
+              await runGit(this.repoPath!, ['checkout', '--theirs', file], { allowFailure: true });
+              logger.debug(`Resolved ${file} using --theirs`);
+            } catch {
+              await runGit(this.repoPath!, ['checkout', '--ours', file], { allowFailure: true });
+              logger.debug(`Resolved ${file} using --ours (--theirs failed)`);
+            }
+          }
           await runGit(this.repoPath!, ['add', '.'], { allowFailure: true });
-          await runGit(this.repoPath!, ['commit', '-m', `Merge ${cluster.featureBranch} (auto-resolved)`], { allowFailure: true });
+          await runGit(this.repoPath!, ['commit', '-m', `Merge ${cluster.featureBranch} (auto-resolved ${unmergedFiles.length} conflicts)`], { allowFailure: true });
           this.stats.conflicts++;
+          this.stats.conflicts += unmergedFiles.length;
         }
 
         // Push main branch
@@ -1374,6 +1448,9 @@ Read the project direction and codebase, then output the JSON plan.
         // Immediately merge this Worker's branch
         logger.info(`Worker completed, merging: ${workerId}`, { resultLength: result.result?.length });
         try {
+          // Ensure clean state before checkout/merge
+          await this.ensureCleanGitState(`merge ${workerId}`);
+
           const branch = this.workBranch!;
           // Fetch all remotes to update remote tracking branches (needed for origin/workerId)
           await runGit(this.repoPath!, ['fetch', 'origin'], { allowFailure: true });
@@ -1387,23 +1464,33 @@ Read the project direction and codebase, then output the JSON plan.
             logger.info(`Merged: ${workerId}`);
           } catch {
             logger.warn(`Merge conflict for ${workerId}, auto-resolving`);
-            // Accept theirs for content conflicts
+            // Accept theirs for content conflicts with better logging
             const unmergedResult = await runGit(
               this.repoPath!,
               ['diff', '--name-only', '--diff-filter=U'],
               { allowFailure: true }
             );
             const unmergedFiles = (typeof unmergedResult?.stdout === 'string' ? unmergedResult.stdout : '').split('\n').filter(Boolean);
+
+            logger.warn(`Auto-resolving ${unmergedFiles.length} conflicts for ${workerId}`, {
+              files: unmergedFiles.slice(0, 10), // Log first 10 files
+              totalFiles: unmergedFiles.length,
+              strategy: 'theirs-first',
+            });
+
             for (const file of unmergedFiles) {
               try {
                 await runGit(this.repoPath!, ['checkout', '--theirs', file], { allowFailure: true });
+                logger.debug(`Resolved ${file} using --theirs`);
               } catch {
                 await runGit(this.repoPath!, ['checkout', '--ours', file], { allowFailure: true });
+                logger.debug(`Resolved ${file} using --ours (--theirs failed)`);
               }
             }
             await runGit(this.repoPath!, ['add', '.'], { allowFailure: true });
-            await runGit(this.repoPath!, ['commit', '-m', `Merge ${workerId} (auto-resolved)`], { allowFailure: true });
+            await runGit(this.repoPath!, ['commit', '-m', `Merge ${workerId} (auto-resolved ${unmergedFiles.length} conflicts)`], { allowFailure: true });
             this.stats.conflicts++;
+            this.stats.conflicts += unmergedFiles.length;
           }
           // Push after each merge
           await runGit(this.repoPath!, ['push', 'origin', branch], { allowFailure: true });

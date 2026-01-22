@@ -49,6 +49,11 @@ export const OrchestratorConfigSchema = z
 
     // Environment
     envFiles: z.array(z.string()).optional(), // Paths to env files to copy to each worker worktree
+    env: z.record(z.string(), z.string()).optional(), // Environment variables to set for all sessions
+
+    // Git merge behavior
+    mergeStrategy: z.enum(['auto-resolve', 'skip', 'fail', 'theirs', 'ours', 'union']).default('auto-resolve'),
+    maxAutoResolveConflicts: z.number().int().min(0).default(100), // Max conflicts before aborting
 
     // Legacy fields (for backward compatibility migration)
     engineerManagerGroupSize: z.number().int().min(1).max(8).optional(),
@@ -98,6 +103,9 @@ export const OrchestratorConfigSchema = z
       maxTotalToolUses: config.maxTotalToolUses,
       maxRunDurationMinutes: config.maxRunDurationMinutes,
       envFiles: config.envFiles,
+      env: config.env,
+      mergeStrategy: config.mergeStrategy,
+      maxAutoResolveConflicts: config.maxAutoResolveConflicts,
     };
   });
 

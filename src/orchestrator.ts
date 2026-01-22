@@ -1009,10 +1009,13 @@ Read the codebase, then output the JSON plan.
     // ─────────────────────────────────────────────────────────────
     logger.info(`[Iteration ${iteration}] Phase 3: Executing workers and merging to feature branches`);
 
-    for (const cluster of clusters) {
+    // Run all clusters in parallel (each cluster works on its own feature branch)
+    const clusterPromises = clusters.map(async (cluster) => {
       const assignments = clusterWorkerAssignments.get(cluster.featureBranch) || [];
       // Track assignments for retry
       const currentAssignments = new Map(assignments.map((a) => [a.worker, a]));
+
+      logger.info(`Starting cluster ${cluster.featureBranch} with ${assignments.length} workers`);
 
       // Process this cluster's workers with retry logic for rate limits
       let workerPromises = assignments.map((assignment) => {
@@ -1028,7 +1031,7 @@ Read the codebase, then output the JSON plan.
 
       // Retry rate-limited workers
       for (let retry = 0; retry < 3; retry++) {
-        const rateLimitedWorkers = results.filter((r) => r.rateLimited);
+        const rateLimitedWorkers = results.filter((r) => 'rateLimited' in r && r.rateLimited);
         if (rateLimitedWorkers.length === 0) break;
 
         logger.info(`Retrying ${rateLimitedWorkers.length} rate-limited workers in cluster`, { featureBranch: cluster.featureBranch, retry: retry + 1 });
@@ -1037,7 +1040,7 @@ Read the codebase, then output the JSON plan.
           const assignment = currentAssignments.get(result.workerId);
           const workerSession = cluster.workers.find((w: Session) => w.id === result.workerId);
           if (!assignment || !workerSession) {
-            return Promise.resolve({ workerId: result.workerId, worker: result.worker, success: false, error: 'Session not found for retry' });
+            return Promise.resolve({ workerId: result.workerId, worker: result.worker, success: false, error: 'Session not found for retry', rateLimited: undefined });
           }
           return this.executeWorkerAssignmentInCluster(assignment, workerSession, cluster.featureBranch, iteration);
         });
@@ -1055,7 +1058,7 @@ Read the codebase, then output the JSON plan.
         }
       }
 
-      // Merge workers to feature branch
+      // Merge workers to feature branch (serial within cluster to avoid git conflicts)
       for (const result of results) {
         if (result.success && result.workerId) {
           try {
@@ -1094,7 +1097,28 @@ Read the codebase, then output the JSON plan.
           logger.error(`Worker ${result.workerId} failed in cluster ${cluster.featureBranch}`, { error: result.error });
         }
       }
-    }
+
+      logger.info(`Cluster ${cluster.featureBranch} completed with ${assignments.length} workers`);
+
+      return {
+        featureBranch: cluster.featureBranch,
+        completed: results.filter((r) => r.success).length,
+        failed: results.filter((r) => !r.success && !('rateLimited' in r && r.rateLimited)).length,
+        results,
+      };
+    });
+
+    // Wait for all clusters to complete in parallel
+    const clusterResults = await Promise.all(clusterPromises);
+
+    // Log summary of all clusters
+    logger.info(`All clusters completed`, {
+      totalClusters: clusters.length,
+      clustersCompleted: clusterResults.filter((c) => c.completed > 0).length,
+      totalWorkers: clusterResults.reduce((sum, c) => sum + c.results.length, 0),
+      workersCompleted: clusterResults.reduce((sum, c) => sum + c.completed, 0),
+      workersFailed: clusterResults.reduce((sum, c) => sum + c.failed, 0),
+    });
 
     // ─────────────────────────────────────────────────────────────
     // Phase 4: Merge feature branches to main (if ready)

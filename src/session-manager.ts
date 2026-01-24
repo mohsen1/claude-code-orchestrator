@@ -195,8 +195,8 @@ export class SessionManager extends EventEmitter {
       throw new Error(`Session ${sessionId} not found`);
     }
 
-    // Check if session needs context compaction
-    if (session.metrics.totalTokensUsed > this.config.compactThreshold) {
+    // Check if session needs context compaction (skip if already compacting to prevent recursion)
+    if (!session.isCompacting && session.metrics.totalTokensUsed > this.config.compactThreshold) {
       this.emit('session:needs-compaction', { sessionId });
       // Note: Actual compaction should be triggered by orchestrator
     }
@@ -565,6 +565,12 @@ export class SessionManager extends EventEmitter {
       return;
     }
 
+    // Prevent recursive compaction - if already compacting, skip
+    if (session.isCompacting) {
+      logger.warn('Session already compacting, skipping', { sessionId });
+      return;
+    }
+
     const defaultSummaryPrompt = `
 Summarize the work done in this session so far:
 - What files were created/modified?
@@ -575,33 +581,41 @@ Summarize the work done in this session so far:
 Be comprehensive but concise.
 `;
 
-    // Generate summary from current session
-    let summary = '';
-    for await (const msg of this.executeTask(
-      sessionId,
-      summaryPrompt || defaultSummaryPrompt
-    )) {
-      if ('result' in msg && msg.result) {
-        summary = msg.result;
+    // Set flag to prevent recursive compaction triggers
+    session.isCompacting = true;
+
+    try {
+      // Generate summary from current session
+      let summary = '';
+      for await (const msg of this.executeTask(
+        sessionId,
+        summaryPrompt || defaultSummaryPrompt
+      )) {
+        if ('result' in msg && msg.result) {
+          summary = msg.result;
+        }
       }
+
+      // Clear Claude session ID to start fresh
+      const oldSessionId = session.claudeSessionId;
+      session.claudeSessionId = undefined;
+      session.metrics.lastCompactedAt = new Date();
+
+      // Reset token count (summary is now the context)
+      session.metrics.totalTokensUsed = 0;
+
+      this.emit('session:compacted', {
+        sessionId,
+        oldClaudeSessionId: oldSessionId,
+        summaryLength: summary.length,
+      });
+
+      // Next task will start fresh session with summary as context
+      // The orchestrator should prepend the summary to the next prompt
+    } finally {
+      // Always clear the flag, even if compaction fails
+      session.isCompacting = false;
     }
-
-    // Clear Claude session ID to start fresh
-    const oldSessionId = session.claudeSessionId;
-    session.claudeSessionId = undefined;
-    session.metrics.lastCompactedAt = new Date();
-
-    // Reset token count (summary is now the context)
-    session.metrics.totalTokensUsed = 0;
-
-    this.emit('session:compacted', {
-      sessionId,
-      oldClaudeSessionId: oldSessionId,
-      summaryLength: summary.length,
-    });
-
-    // Next task will start fresh session with summary as context
-    // The orchestrator should prepend the summary to the next prompt
   }
 
   // ─────────────────────────────────────────────────────────────

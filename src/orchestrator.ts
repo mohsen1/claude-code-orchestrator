@@ -1278,6 +1278,14 @@ IMPORTANT:
 - Only report complete when ALL documented tasks are verifiably done
 - If there are still failing tests or incomplete features, assign that work
 
+CRITICAL - NO DUPLICATE WORK:
+- Each task/feature must be assigned to EXACTLY ONE worker
+- Do NOT assign the same work to multiple workers with different wording
+- BAD: worker-1 "add recursion limits", worker-2 "add depth guards" (same work!)
+- GOOD: worker-1 "add recursion limits to solver/", worker-2 "implement error TS2345"
+- Before finalizing, review all assignments and merge any that overlap conceptually
+- If in doubt whether two tasks overlap, assign them to the SAME worker
+
 Output ONLY valid JSON (no markdown code blocks):
 {"assignments": [{"worker": "worker-1", "area": "...", "files": [...], "tasks": [...], "acceptance": "..."}]}
 

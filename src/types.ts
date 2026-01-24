@@ -122,6 +122,9 @@ export interface Session {
 
   /** API key index for rate limit rotation */
   authConfigIndex?: number;
+
+  /** Flag to prevent recursive compaction triggers */
+  isCompacting?: boolean;
 }
 
 export interface SessionMetrics {
